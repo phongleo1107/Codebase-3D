@@ -1,6 +1,6 @@
 # Architecture
 
-> **Build status: only the backend contract layer is implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, and `app/logging_setup.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
+> **Build status: the backend contract layer and the URL/egress security boundary are implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, and `app/security/net_guard.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
 >
 > Legend: `Planned` · `In progress` · `Implemented`
 
@@ -38,7 +38,7 @@ Python 3.14, FastAPI, Pydantic v2 (pure v2 only — `pydantic.v1` is incompatibl
 | `app/logging_setup.py` | JSON logs + redaction filter | Implemented |
 | `app/models/` | Pydantic request/response schemas | Implemented |
 | `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate | Planned |
-| `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | Planned |
+| `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | **In progress** — `url_validation.py` and `net_guard.py` Implemented; secret filter, path safety, and HMAC tokens Planned |
 | `app/fetch/` | GitHub client, streaming archive reader | Planned |
 | `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder | Planned |
 
@@ -115,13 +115,15 @@ Errors are always `{"error": {"code", "message", "requestId"}}` — exactly thos
 
 The error contract is implemented in `app/errors.py`: 14 codes, each with a fixed HTTP status and a **static** message. `AppError.__init__` takes no arguments, so a call site structurally cannot attach a path or an upstream string that would end up in a response body. The routes and the exception handler that returns these bodies are not written yet.
 
-## Security Boundaries · *Planned*
+## Security Boundaries · *In progress*
 
 Three trust transitions, each with an explicit validation layer:
 
-1. **Client → API** — URL grammar validation, request body cap, rate limit, concurrency gate.
-2. **GitHub → Analyzer** — redirect host allowlist, resolved-IP check, download/extraction/ratio limits, per-member path rules, secret filter.
-3. **API → Browser** — zod validation with hard caps; source rendered as text nodes, never as an HTML string.
+1. **Client → API** — URL grammar validation (`security/url_validation.py`, *Implemented*), request body cap, rate limit, concurrency gate (*Planned*).
+2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, **no caller yet**); download/extraction/ratio limits, per-member path rules, secret filter (*Planned*).
+3. **API → Browser** — zod validation with hard caps; source rendered as text nodes, never as an HTML string (*Planned*).
+
+The two implemented modules are pure functions: neither opens a socket, and the guard is only a control once `app/fetch/` calls it on every hop.
 
 Detail and threat mapping in [SECURITY.md](SECURITY.md).
 

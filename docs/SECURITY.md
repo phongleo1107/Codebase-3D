@@ -1,6 +1,6 @@
 # Security Model
 
-> **Almost no security control in this document is implemented.** As of 2026-08-29 only the backend contract layer exists (config, errors, models, logging) — there is no network, archive, parsing, or routing code, so every ingestion and resource-limit control below is still `Planned`. Rows marked `Implemented` name the file; treat every other row as aspirational. Flip a row only when you have seen the code, and name the file in the same edit.
+> **Most security controls in this document are still not implemented.** As of 2026-08-29 the backend contract layer (config, errors, models, logging) and the **URL/egress security boundary** (`app/security/url_validation.py`, `app/security/net_guard.py`) exist. There is still no archive, parsing, or routing code, and **nothing calls the egress guard yet** because no HTTP client has been written — so every ingestion and resource-limit control below is still `Planned`. Rows marked `Implemented` name the file; treat every other row as aspirational. Flip a row only when you have seen the code, and name the file in the same edit.
 >
 > Note in particular that the limit *constants* now exist in `app/config.py`. **A constant is not a control.** Every row describing enforcement of a download, extraction, ratio, count, or duration limit stays `Planned` until code reads that constant and rejects something.
 
@@ -30,14 +30,17 @@ Every control below is **`Planned`** unless its Status cell says otherwise.
 
 | Threat | Risk | Mitigation | Status |
 |---|---|---|---|
-| Arbitrary URL fetched from user input | Critical | Accept only `https://github.com/<owner>/<repo>`, parsed against a strict grammar; the download host is never user-supplied | Planned |
-| Redirect to an attacker host | Critical | `follow_redirects=False` everywhere; exactly one redirect permitted, its host compared by **string equality** against a one-element allowlist (`codeload.github.com`) — never `endswith`, which `codeload.github.com.evil.com` defeats | Planned |
-| DNS rebinding / hostile resolver | High | Resolve the host and require every returned address to be globally routable (`ipaddress.is_global`, after unmapping `::ffff:`) | Planned |
-| Private / loopback / link-local targets | Critical | Rejected by both the URL grammar and the resolved-IP check. Explicitly: `localhost`, `127.0.0.1`, `::1`, `10/8`, `172.16/12`, `192.168/16`, `169.254.169.254` | Planned |
-| Non-HTTPS or non-HTTP schemes | High | Scheme must be exactly `https`; kills `file:`, `ftp:`, `javascript:`, and protocol-relative `//evil` Locations | Planned |
+| Arbitrary URL fetched from user input | Critical | Accept only `https://github.com/<owner>/<repo>`, parsed against a strict grammar; the download host is never user-supplied | **Partial** — the grammar is `app/security/url_validation.py`. The second half is a property of the fetch client, which does not exist |
+| Redirect to an attacker host | Critical | `follow_redirects=False` everywhere; exactly one redirect permitted, its host compared by **string equality** against a one-element allowlist (`codeload.github.com`) — never `endswith`, which `codeload.github.com.evil.com` defeats | **Partial** — the equality allowlist is `app/security/net_guard.validate_download_url`. `follow_redirects=False` and the one-hop rule are client behaviour and land with `app/fetch/`; today they exist only in a test helper |
+| DNS rebinding / hostile resolver | High | Resolve the host and require every returned address to be globally routable — `is_global`, **plus** `not is_reserved`, `not is_multicast`, and `not is_site_local`, after unmapping `::ffff:`. All three extras are load-bearing: on CPython 3.14.7 `is_global` is `True` for `::127.0.0.1`, `64:ff9b::7f00:1`, `224.0.0.1`, and every address in `fec0::/10`. A sweep of all 65 536 IPv6 `/16` prefixes confirms those four predicates leave no further gap | **Implemented** — `app/security/net_guard.assert_public_ip`; no caller yet |
+| Private / loopback / link-local targets | Critical | Rejected by both the URL grammar and the resolved-IP check. Explicitly: `localhost`, `127.0.0.1`, `::1`, `10/8`, `172.16/12`, `192.168/16`, `169.254.169.254` | **Implemented** — `app/security/url_validation.py` and `app/security/net_guard.py` |
+| Non-HTTPS or non-HTTP schemes | High | Scheme must be exactly `https`; kills `file:`, `ftp:`, `javascript:`, and protocol-relative `//evil` Locations | **Implemented** — `app/security/url_validation.py` and `app/security/net_guard.py` |
 | Proxy env vars redirecting traffic | Medium | `trust_env=False` on the HTTP client, ignoring `HTTP_PROXY` / `ALL_PROXY` / `NO_PROXY` | Planned |
 | Credential leak to a redirect target | High | The tarball download request is issued **without** an `Authorization` header. If host validation were ever bypassed, no token leaves the process | Planned |
-| Homograph / lookalike hostnames | Medium | ASCII-only check on the raw URL before parsing | Planned |
+| Homograph / lookalike hostnames | Medium | ASCII-only check on the raw URL before parsing | **Implemented** — `app/security/url_validation.py` |
+| URL parser differential | Medium | `urlsplit` silently deletes tab/CR/LF anywhere in a URL, so `https://gith<TAB>ub.com/o/r` parses as `github.com`. Both modules screen C0 controls, space, DEL, and `\` **before** parsing, so no accepted URL can read differently to a human than to the parser | **Implemented** — `app/security/url_validation.py` and `app/security/net_guard.py` |
+
+> **Residual risk — DNS rebinding is narrowed, not closed.** `assert_public_ip` resolves the name, but the connection that follows is made *by name*, so a resolver that answers differently the second time is not caught. Closing it fully requires connect-by-IP with SNI, which v1 does not do.
 
 ### Command injection
 
@@ -57,7 +60,7 @@ Every control below is **`Planned`** unless its Status cell says otherwise.
 | Zip/tar bomb | High | Cumulative decompressed cap (256 MiB) **plus** a compression-ratio guard (max 100:1, enforced once past an 8 MiB floor, checked after every member) so a gigabyte-of-zeros bomb trips at ~8 MiB | Planned |
 | Malicious member names (NUL, lone surrogates) | Medium | Reject names containing NUL or failing a strict UTF-8 round-trip — `tarfile`'s `surrogateescape` decoding otherwise leaks raw bytes | Planned |
 | Archive with multiple root directories | Medium | Root must match `^[A-Za-z0-9._-]+-[0-9a-f]{7,40}$` and be identical across all members | Planned |
-| Future disk I/O reintroducing traversal | Medium | `security/path_safety.safe_relative_path()` (realpath + `commonpath`) is implemented and tested even though nothing currently writes files | Planned |
+| Future disk I/O reintroducing traversal | Medium | `security/path_safety.safe_relative_path()` (realpath + `commonpath`) **is to be** implemented and tested even though nothing currently writes files. The module does not exist yet | Planned |
 
 ### Malicious repository code
 
@@ -109,6 +112,7 @@ Every control below is **`Planned`** unless its Status cell says otherwise.
 |---|---|---|---|
 | Stack traces / filesystem paths in responses | Medium | Fixed body shape `{"error": {code, message, requestId}}`; unhandled exceptions return only a request ID, with the traceback logged server-side | **Partial** — the contract exists in `app/errors.py` (static messages; `AppError.__init__` takes no arguments, so dynamic detail cannot reach a body). No FastAPI exception handler exists yet, so nothing actually returns it |
 | Pydantic validation echoing user input | Medium | `RequestValidationError` mapped to a generic 422 — never return Pydantic's `detail`, which embeds the offending input | Planned |
+| A *stdlib* exception echoing user input | Medium | `urlsplit` is not total: a malformed bracketed host (`https://[evil.com]/o/r`) raises `ValueError` with the host quoted in the message. Every partial call in the security modules is wrapped and re-raised as a typed `AppError` with `from None`, so the value never reaches a body and no traceback renders it. Note `from None` clears `__cause__` and suppresses *display* of `__context__`; the original exception object is still reachable via `.__context__`, so an error handler must never serialize exception attributes. A fuzz sweep in each test file asserts nothing but the typed error escapes | **Implemented** — `app/security/url_validation.py`, `app/security/net_guard.py` |
 
 ### Supply chain
 
@@ -127,8 +131,13 @@ Do not publish this claim before verifying the implementation. Do not claim stro
 
 ## Security Testing
 
-None of these tests exist yet. All are required before the MVP is considered done.
+Malicious archives are to be built in-process with `tarfile` + `io.BytesIO` rather than checked in as binary fixtures, so each attack is readable in the diff. **No security test may touch the network** — this is enforced, not trusted: `tests/conftest.py` replaces `getaddrinfo`, `create_connection`, and `socket.connect` for the whole session with a call that raises, so a test that forgets to stub fails loudly instead of quietly resolving a real name.
 
-Malicious archives are to be built in-process with `tarfile` + `io.BytesIO` rather than checked in as binary fixtures, so each attack is readable in the diff. No security test should touch the network.
+Done — `backend/tests/test_url_validation.py`, `backend/tests/test_net_guard.py` (389 cases):
 
-Required coverage: URL validation (including homographs, userinfo, ports, private IPs, and `evil.com/github.com/o/r`); redirect handling (including an assertion that the codeload request carries **no** `Authorization`); resolved-IP rejection; archive traversal, symlinks, hardlinks, bombs, and malformed names; secret filtering as an end-to-end invariant over the whole response; parser robustness on truncated, binary, and pathological input; limit enforcement; rate limiting and concurrency; and an assertion that **no error body ever contains a traceback, a filesystem path, or a token**.
+- URL validation: homographs, userinfo, ports, private IPs, `evil.com/github.com/o/r`, encoded and literal traversal, NUL and other control characters, oversized input, and the `urlsplit` tab/CR/LF differential.
+- Redirect handling: `302` to an attacker host, to a suffix of the allowlisted host, downgraded to `http`, protocol-relative, relative, and to the metadata endpoint; a second redirect; a missing `Location`. Each asserts the disallowed hop is **never requested**.
+- Resolved-IP rejection, including the three addresses `is_global` alone would admit.
+- The rejection body is asserted byte-identical across every rejected input, so no offending value can reach a response.
+
+Still required: an assertion that the codeload request carries **no** `Authorization` (needs the client); archive traversal, symlinks, hardlinks, bombs, and malformed names; secret filtering as an end-to-end invariant over the whole response; parser robustness on truncated, binary, and pathological input; limit enforcement; rate limiting and concurrency; and an assertion that **no error body ever contains a traceback, a filesystem path, or a token**.
