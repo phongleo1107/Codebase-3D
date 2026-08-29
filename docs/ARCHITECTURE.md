@@ -1,6 +1,6 @@
 # Architecture
 
-> **Build status: the backend contract layer, the URL/egress security boundary, and the GitHub client are implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, and `app/fetch/github.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
+> **Build status: the backend contract layer, the URL/egress security boundary, the GitHub client, and the streaming archive reader are implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, `app/fetch/github.py`, `app/fetch/archive.py`, and `app/analysis/deadline.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Note that **no code path yet joins the client to the reader** — the download request is built but never sent. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
 >
 > Legend: `Planned` · `In progress` · `Implemented`
 
@@ -39,20 +39,22 @@ Python 3.14, FastAPI, Pydantic v2 (pure v2 only — `pydantic.v1` is incompatibl
 | `app/models/` | Pydantic request/response schemas | Implemented |
 | `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate | Planned |
 | `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | **In progress** — `url_validation.py` and `net_guard.py` Implemented; secret filter, path safety, and HMAC tokens Planned |
-| `app/fetch/` | GitHub client, streaming archive reader | **In progress** — `github.py` Implemented (preflight + validated redirect); the streaming archive reader is Planned |
-| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder | Planned |
+| `app/fetch/` | GitHub client, streaming archive reader | **Implemented** — `github.py` (preflight + validated redirect) and `archive.py` (streaming extraction + member validation). Nothing calls both yet |
+| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder | **In progress** — `deadline.py` Implemented; everything else Planned |
 
 Limits live in `Settings` and nowhere else — request models read them through
 `get_settings()` at validation time rather than restating a number, so
 tightening a limit in the environment is actually enforced at the boundary.
 
-### Repository ingestion · *In progress*
+### Repository ingestion · *Implemented, unwired*
 
 1. *Implemented* — Preflight `GET /repos/{owner}/{repo}` → default branch, canonical case, size. Reject oversized repos before any archive byte moves. `404` and `403` collapse to one opaque error so a configured token cannot become a private-repo existence oracle.
 2. *Implemented* — `GET /repos/{owner}/{repo}/tarball/{ref}` with `follow_redirects=False`.
 3. *Implemented* — Validate the single redirect (see [SECURITY.md](SECURITY.md)). The re-request is built **without credentials** by `download_request()`; sending it belongs to step 4.
-4. *Planned* — Stream the gzip into `tarfile` in non-seeking mode (`r|gz`). **Nothing is written to disk** — see ADR-003.
-5. *Planned* — The commit SHA is harvested from the tar root directory name and pins all later source fetches. That root name is authoritative: `get_download_url` returns a SHA only when the redirect target happens to pin one, which it does not for a branch ref (`.../legacy.tar.gz/refs/heads/main`).
+4. *Implemented* — Stream the download into `tarfile` in non-seeking mode. **Nothing is written to disk** — see ADR-003. `app/fetch/archive.iter_source_files` takes the byte iterator and yields `(PurePosixPath, bytes)` for each acceptable regular file, with the root directory stripped.
+
+   The gzip step is **ours, not `tarfile`'s**: `mode="r|"` over an explicit `gzip.GzipFile`, rather than `r|gz`. That is what creates a seam to meter the decompressed side at. It matters because a non-seeking `tarfile` must read *past* the body of every member — including ones the reader skips for being oversized — so a bomb whose payload is a single 1 GiB member yields no files at all and is invisible to any accounting that sums accepted members.
+5. *Planned* — The commit SHA is harvested from the tar root directory name and pins all later source fetches. That root name is authoritative: `get_download_url` returns a SHA only when the redirect target happens to pin one, which it does not for a branch ref (`.../legacy.tar.gz/refs/heads/main`). `archive.py` validates the root against `^[A-Za-z0-9._-]+-[0-9a-f]{7,40}$` and requires it to be identical across members, but it does not yet *return* the SHA — no caller needs it until the pipeline exists.
 
 The token is never a client-level header — see ADR-009.
 
@@ -122,7 +124,7 @@ The error contract is implemented in `app/errors.py`: 14 codes, each with a fixe
 Three trust transitions, each with an explicit validation layer:
 
 1. **Client → API** — URL grammar validation (`security/url_validation.py`, *Implemented*), request body cap, rate limit, concurrency gate (*Planned*).
-2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, called on every hop by `fetch/github.py`); the size preflight (*Implemented*); download/extraction/ratio limits, per-member path rules, secret filter (*Planned*).
+2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, called on every hop by `fetch/github.py`); the size preflight (*Implemented*); download/extraction/ratio limits and per-member path rules (`fetch/archive.py`, *Implemented*); secret filter (*Planned*).
 3. **API → Browser** — zod validation with hard caps; source rendered as text nodes, never as an HTML string (*Planned*).
 
 The two `security/` modules are pure functions — neither opens a socket. `app/fetch/github.py` is what turns the guard into a control: it is the only module that opens one, and it calls both guard functions before returning any URL.

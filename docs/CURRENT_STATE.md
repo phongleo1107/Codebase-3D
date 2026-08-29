@@ -4,13 +4,13 @@
 
 Build the MVP defined in [PRD.md](../PRD.md): paste a public GitHub URL → safely analyze a TS/JS repository → render its dependency graph in navigable 3D.
 
-Steps 1-3 of the build order are done and green: **the backend contract** (config, errors, models, logging), **the URL/egress security boundary** (`security/url_validation.py`, `security/net_guard.py`), and **the GitHub client** (`fetch/github.py`) — the first module in the project that can open a socket, and the guard's first caller.
+Steps 1-4 of the build order are done and green: **the backend contract** (config, errors, models, logging), **the URL/egress security boundary** (`security/url_validation.py`, `security/net_guard.py`), **the GitHub client** (`fetch/github.py`) — the first module in the project that can open a socket — and **the streaming archive reader** (`fetch/archive.py`).
 
-It resolves a download URL; it does not download. No archive byte has ever been fetched by this codebase.
+**The two halves of ingestion are not joined.** `github.py` builds the credential-free download request but never sends it; `archive.py` consumes a byte iterator that, so far, has only ever come from a test fixture. No archive byte has been fetched over a network by this codebase.
 
 ## Working
 
-**The backend contract layer, the security boundary, the GitHub client, and their tests.** There is still no routing, parsing, or analysis code: `app/api/` and `app/analysis/` remain empty packages, `app/fetch/` holds the client but not the archive reader, and `app/security/` holds two of its five planned modules.
+**The backend contract layer, the security boundary, the GitHub client, the archive reader, and their tests.** There is still no routing, parsing, or analysis code: `app/api/` remains an empty package, `app/analysis/` holds only `deadline.py`, and `app/security/` holds two of its five planned modules.
 
 | Path | Notes |
 |---|---|
@@ -28,10 +28,12 @@ It resolves a download URL; it does not download. No archive byte has ever been 
 | `backend/app/security/url_validation.py` | `parse_github_url` → frozen `RepoRef`; strict grammar, ASCII-only, allowlisted host |
 | `backend/app/security/net_guard.py` | `validate_download_url` (equality allowlist) + `assert_public_ip` (resolved-IP check). Both are now called by `fetch/github.py` on every redirect |
 | `backend/app/fetch/github.py` | `create_client` (`follow_redirects=False`, `trust_env=False`, no `Authorization` default), `get_repo_metadata` (preflight, size gate, 403/404 collapse), `get_download_url` (validated single hop), `download_request` (the credential-free download GET) |
+| `backend/app/fetch/archive.py` | `iter_source_files` — streams the download through `_CountingRawStream` → `gzip` → `_DecompressedStream` → `tarfile("r|")`, yielding `(PurePosixPath, bytes)` per acceptable regular file. `Limits` is a no-default view onto `Settings` |
+| `backend/app/analysis/deadline.py` | `Deadline` — frozen, monotonic; `check()` raises `AnalysisTimeoutError` |
+| `backend/tests/fixtures/tarballs.py` | `make_tar`, `make_source_tar`, `make_member_with_name`, `make_pax_name`, `make_symlink_member`, `make_hardlink_member`, `make_oversized_header`, `make_many_members`, `make_bomb`, `chunked`, `noise` |
 | `backend/tests/conftest.py` | Session-scoped autouse fixture blocking `getaddrinfo`, `gethostbyname`, `create_connection`, and `socket.connect`/`connect_ex`. Raises `NetworkAccessAttempted`, a `RuntimeError` — deliberately *not* an `OSError`, so it travels straight through `assert_public_ip`'s handler instead of being swallowed as a rejection |
-| `backend/tests/` | 637 tests across config, errors, models, logging, URL validation, net guard, GitHub client |
-| `backend/app/{api,analysis}/` | Still empty packages |
-| `backend/app/fetch/archive.py` | Not written — the streaming tarball reader is the next task |
+| `backend/tests/` | 773 tests across config, errors, models, logging, URL validation, net guard, GitHub client, archive reader, deadline |
+| `backend/app/api/` | Still an empty package |
 | `backend/app/security/` | `secret_filter.py`, `path_safety.py`, HMAC tokens still to come |
 | `.claude/settings.local.json` | Local tool permissions, not source |
 
@@ -40,7 +42,7 @@ No `frontend/`, no Docker files, no CI.
 **Verified locally on 2026-08-29** (Python 3.14.7, uv 0.12.3):
 
 - `uv sync` resolves and installs cleanly; the project installs as an editable package.
-- `uv run pytest` → **637 passed**. `uv run mypy` (strict) → clean over 23 files. `uv run ruff check .` → clean.
+- `uv run pytest` → **773 passed** in ~6s. `uv run mypy` (strict) → clean over 29 files. `uv run ruff check .` → clean.
 - tree-sitter ABI spike printed **`14`**, and `QueryCursor` imports successfully alongside `Language`, `Parser`, and `Query`.
 
 Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was `["app", "tests"]`, which pointed *inside* the package so isort never treated `app` as first-party), and `S105`/`S106` added to the test per-file-ignores because redaction tests must hardcode fake credentials.
@@ -52,6 +54,8 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 ## Broken / Known Issues
 
 - No CI yet.
+- **The compression-ratio guard and the 50 000-member cap are in tension at the extreme.** An archive of 50 000 *empty* files is mostly zero padding: measured at ~25 MiB extracted from ~355 KiB compressed, a ratio of ~74 against a cap of 100. It passes today, but with under a 1.4× margin that no real repository approaches — ordinary source sits around 5:1. The 50 000-member test therefore lifts the ratio guard, so it tests the count cap alone rather than becoming a hostage to the zlib version. If a legitimate repository is ever refused as a bomb, this is the interaction to look at first; the fix is to raise `RATIO_FLOOR_BYTES` or to exclude header padding from the numerator, not to raise the ratio.
+- **`archive.py` never returns the commit SHA**, although it validates the archive root that carries it. ARCHITECTURE.md ingestion step 5 stays `Planned` for that reason. Nothing needs it until a pipeline exists, but do not read the root check as "the SHA is harvested".
 - **`assert_public_ip` narrows DNS rebinding, it does not close it.** The connection that follows is made by name, so a resolver that answers differently the second time is not caught. Closing it needs connect-by-IP with SNI, which v1 does not do. Recorded in `docs/SECURITY.md`.
 - **`ruff format` is not a project gate — do not run it.** `uv run ruff check .` is the gate and is clean. `ruff format --check` reports 5 of 21 files as unformatted: four pre-existing (`app/logging_setup.py`, `tests/test_config.py`, `tests/test_logging.py`, `tests/test_models.py`) and `app/security/net_guard.py`, which is unformatted for the same reason they are — the formatter wants to join wrapped constructs into lines that then exceed the configured `line-length = 100`. Running it would rewrite unrelated code to no benefit. Either adopt it repo-wide as a deliberate decision or leave it alone; do not apply it to one file.
 - The contract layer is unexercised by any route — nothing constructs an `AnalyzeResponse` from real data yet, so field *semantics* are only as good as the documentation.
@@ -59,6 +63,18 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 - The pydantic **mypy plugin is not enabled** (no `plugins` key in `[tool.mypy]`). Constructor type-checking still works via PEP 681 `@dataclass_transform` on pydantic's metaclass. Reviewed and judged unnecessary; do not assume the plugin is present when reading type errors.
 
 ## Recently Completed
+
+- **2026-08-29** — **Streaming archive reader implemented**: `app/fetch/archive.py`, `app/analysis/deadline.py`, `tests/fixtures/tarballs.py`, plus 136 tests. `docs/SECURITY.md`'s "Path traversal and archive attacks" table moved to five `Implemented` rows, and four resource-exhaustion rows moved to `Implemented` or `Partial`.
+
+  Decisions and non-obvious behaviours worth carrying forward:
+  - **The gzip layer is ours, not `tarfile`'s** — `mode="r|"` over an explicit `gzip.GzipFile` rather than `r|gz`. This is the single most important design point in the module. `r|gz` leaves no seam between decompression and tar parsing, and metering has to happen at that seam: a non-seeking `tarfile` reads *past* the body of every member, including ones the reader skips for being oversized. A bomb whose payload is one 1 GiB member therefore yields **no files at all**, and any accounting that sums the sizes of accepted members sees zero bytes while a gigabyte goes through the decompressor. Metering the decompressed stream on every read kills it at ~8 MiB.
+  - **A tar of pure zeros is not a bomb.** Confirmed empirically: `tarfile` reads the first zero block as the end-of-archive marker and stops, so a gzipped gigabyte of zeros yields zero members after ~10 KiB. The fixture had to become a tar *header* declaring a 1 GiB member followed by zeros. It is built by concatenating gzip members (`gzip` decodes a concatenated stream as one continuous output), so the 1 GiB bomb costs about a megabyte and no measurable time.
+  - **The compression-ratio denominator is bytes *delivered to the decompressor*, not bytes pulled from the iterator.** Read-ahead sitting in the adapter's buffer would inflate the denominator and delay the trip. As a consequence the tests must chunk their input realistically — a whole archive handed over in one `read` makes every early-abort assertion vacuous — and any test that measures consumption must use incompressible filler, because a megabyte of `b"x"` arrives in the decompressor's first read.
+  - **`Limits` is a no-default frozen view onto `Settings`.** It restates the field *names* but never the numbers, so `Settings` stays the only source of values (CLAUDE.md) while a test can still exercise one control with the others lifted out of the way.
+  - **Rejecting the archive and skipping a member are different outcomes**, and the split is deliberate: a path an honest `git archive` could not have produced (absolute, traversing, multi-rooted, malformed) aborts the run; a path merely past a resource budget (too deep, too long, too big) drops that one file. Several tests exist only to prove a given input lands on the right side of that line.
+  - **`RepositoryTooLargeError` for byte budgets, `ArchiveRejectedError` for structure.** No new `ErrorCode` was added — the 14 in `errors.py` are the frozen wire contract, and a bomb is adequately described by the existing archive-rejected code. The bomb test asserts the *ratio* error specifically, so it would notice if the 256 MiB extracted cap were quietly doing the work instead.
+  - **The 24 controls in the module were mutation-tested one deletion at a time; 21 are caught.** The three survivors are annotated in the code: the absolute-path check is subsumed by the empty-component and root-name checks, and a negative member size is unreachable because `tarfile` raises `ReadError("invalid offset")` on such a header before the member is handed over. A fourth survivor was **not** redundant and was a real hole in the suite — deleting the `\` → `/` normalization left everything green, because every backslash case then in the tests failed on the root-name pattern instead. `root-sha/src\..\..\evil.ts` would have been yielded verbatim. Cases with backslashes *below* the root were added.
+  - Two fixture-verifying tests exist on purpose: one asserts the pax fixture really produces a NUL in `member.name`, one asserts the surrogate fixture really writes a raw `\xff`. Without them, a future `tarfile` that sanitized either would turn both attack tests green for the wrong reason.
 
 - **2026-08-29** — **GitHub client implemented**: `app/fetch/github.py` plus 88 tests, and three new `Settings` fields (`GITHUB_CONNECT_TIMEOUT_S`, `GITHUB_READ_TIMEOUT_S`, `MAX_GITHUB_CONNECTIONS` — timeouts are operational limits, so they live in `Settings` like every other one). This is the first module that can open a socket and the first caller of the egress guard. `docs/SECURITY.md` gained four `Implemented` rows (Arbitrary URL, Redirect to attacker host, Proxy env vars, Credential leak) plus the private-repo-oracle row, and two `Partial` ones (Huge repository, the two command-injection rows).
 
@@ -106,8 +122,9 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 
 ## Next Steps
 
-1. Implement `fetch/archive.py` with in-process malicious-tarball fixtures (`io.BytesIO`), covering traversal, symlinks, bombs, and malformed names. Still no network.
-2. When routes land, wire `AppError` into a FastAPI exception handler and map `RequestValidationError` to a bare `INVALID_REQUEST` — pydantic's `detail` embeds the offending input and must never be returned.
+1. Implement `security/secret_filter.py` and `security/path_safety.py`.
+2. Write the pipeline that finally joins `github.py` to `archive.py` — it constructs one `Deadline` per request, sends `download_request()`, and feeds `response.iter_bytes()` to `iter_source_files`. It should also harvest the commit SHA from the archive root, which `archive.py` validates but does not currently return.
+3. When routes land, wire `AppError` into a FastAPI exception handler and map `RequestValidationError` to a bare `INVALID_REQUEST` — pydantic's `detail` embeds the offending input and must never be returned.
 
 The ABI half of the tree-sitter spike is **done** (see above). The `progress_callback` signature on `Parser.parse()` is still unverified and must be confirmed before the extractor is written.
 

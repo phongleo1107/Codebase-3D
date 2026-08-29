@@ -1,8 +1,8 @@
 # Security Model
 
-> **Most security controls in this document are still not implemented.** As of 2026-08-29 the backend contract layer (config, errors, models, logging), the **URL/egress security boundary** (`app/security/url_validation.py`, `app/security/net_guard.py`), and the **GitHub client that calls it** (`app/fetch/github.py`) exist. The egress guard now has a caller: every redirect the client sees goes through it. There is still no archive, parsing, or routing code, and **no archive byte is ever fetched** — the client resolves a download URL but does not download it — so every extraction and resource-limit control below is still `Planned`. Rows marked `Implemented` name the file; treat every other row as aspirational. Flip a row only when you have seen the code, and name the file in the same edit.
+> **Many security controls in this document are still not implemented.** As of 2026-08-29 the backend contract layer (config, errors, models, logging), the **URL/egress security boundary** (`app/security/url_validation.py`, `app/security/net_guard.py`), the **GitHub client that calls it** (`app/fetch/github.py`), and the **streaming archive reader** (`app/fetch/archive.py`) exist. There is still no parsing, analysis, or routing code, and **nothing in this codebase has ever sent the download request** — `github.py` resolves and builds it, `archive.py` consumes the bytes it would return, and no caller joins the two. The archive controls below are therefore implemented and tested against in-process tarballs, not against a real download. Rows marked `Implemented` name the file; treat every other row as aspirational. Flip a row only when you have seen the code, and name the file in the same edit.
 >
-> Note in particular that the limit *constants* now exist in `app/config.py`. **A constant is not a control.** Every row describing enforcement of a download, extraction, ratio, count, or duration limit stays `Planned` until code reads that constant and rejects something.
+> Note in particular that the limit *constants* have existed in `app/config.py` since before anything read them. **A constant is not a control.** Every remaining row describing enforcement of a node/edge, file-count, rate, or duration limit stays `Planned` until code reads that constant and rejects something.
 
 ## Trust Model
 
@@ -46,20 +46,20 @@ Every control below is **`Planned`** unless its Status cell says otherwise.
 
 | Threat | Risk | Mitigation | Status |
 |---|---|---|---|
-| Shell metacharacters in a repo URL or path | Critical | **No `subprocess` in the ingestion or analysis path at all.** No `git`, no shell, never `shell=True`. Downloading is an HTTP request; extraction is `tarfile` | **Partial** — the ingestion path that exists (`app/fetch/github.py`) is HTTP only and imports no `subprocess`; owner, repo, and ref are percent-encoded per path segment after a character-set check. Extraction and analysis are not written |
-| Git-mediated code execution | High | `git clone` is deliberately not used — git honors `.gitattributes` filters and `core.*` config, which are attacker-controlled | **Partial** — `app/fetch/github.py` fetches the tarball URL over HTTPS; no git invocation exists anywhere. Stays `Partial` until the archive reader lands and the claim covers the whole path |
+| Shell metacharacters in a repo URL or path | Critical | **No `subprocess` in the ingestion or analysis path at all.** No `git`, no shell, never `shell=True`. Downloading is an HTTP request; extraction is `tarfile` | **Partial** — the whole ingestion path now exists (`app/fetch/github.py`, `app/fetch/archive.py`) and neither imports `subprocess`; owner, repo, and ref are percent-encoded per path segment after a character-set check. Analysis is not written |
+| Git-mediated code execution | High | `git clone` is deliberately not used — git honors `.gitattributes` filters and `core.*` config, which are attacker-controlled | **Implemented** — ingestion is an HTTPS fetch plus `tarfile`; no git invocation exists anywhere in the repository. Archive members are read as bytes and never interpreted, so `.gitattributes` is just another file |
 
 ### Path traversal and archive attacks
 
 | Threat | Risk | Mitigation | Status |
 |---|---|---|---|
-| `../../etc/passwd` in an archive member | High | **No file is ever written to disk** (ADR-003), so traversal has no write target. Member paths are still rejected if any component is `""`, `.`, or `..`, after normalizing `\` to a separator | Planned |
-| Absolute paths in members | High | Reject `/…`, `C:\…`, `\\…` | Planned |
-| Symlink / hardlink escape | High | Only regular files are read. `issym`, `islnk`, `ischr`, `isblk`, `isfifo` are skipped and counted, never followed | Planned |
+| `../../etc/passwd` in an archive member | High | **No file is ever written to disk** (ADR-003), so traversal has no write target. Member paths are still rejected if any component is `""`, `.`, or `..`, after normalizing `\` to a separator | **Implemented** — `app/fetch/archive._check_member_name`. The `\` normalization is load-bearing below the root directory, where the root-name pattern cannot help: `root-sha/src\..\..\evil.ts` is otherwise one component that is not `..` |
+| Absolute paths in members | High | Reject `/…`, `C:\…`, `\\…` | **Implemented** — `app/fetch/archive._check_member_name`. Redundant by design (a leading separator becomes an empty component; a drive letter becomes a root that fails `ROOT_PATTERN`), and annotated as such in the code |
+| Symlink / hardlink escape | High | Only regular files are read. `issym`, `islnk`, `ischr`, `isblk`, `isfifo` are skipped and counted, never followed | **Implemented** — `app/fetch/archive.iter_source_files`. `extractfile` is called only after `isfile()`, so a link target is never resolved and `linkname` is never read |
 | Traversal via the `/api/source` path parameter | High | Path must match an HMAC token issued by the analyzer for that exact `owner/repo@sha:path`; forged paths cannot produce a valid token | Planned |
-| Zip/tar bomb | High | Cumulative decompressed cap (256 MiB) **plus** a compression-ratio guard (max 100:1, enforced once past an 8 MiB floor, checked after every member) so a gigabyte-of-zeros bomb trips at ~8 MiB | Planned |
-| Malicious member names (NUL, lone surrogates) | Medium | Reject names containing NUL or failing a strict UTF-8 round-trip — `tarfile`'s `surrogateescape` decoding otherwise leaks raw bytes | Planned |
-| Archive with multiple root directories | Medium | Root must match `^[A-Za-z0-9._-]+-[0-9a-f]{7,40}$` and be identical across all members | Planned |
+| Zip/tar bomb | High | Cumulative decompressed cap (256 MiB) **plus** a compression-ratio guard (max 100:1, enforced once past an 8 MiB floor) so a gigabyte-of-zeros bomb trips at ~8 MiB | **Implemented** — `app/fetch/archive._DecompressedStream`. Both are metered on the *decompressed stream*, on every read, not per accepted member: a non-seeking `tarfile` reads past the body of a member this module skips for being oversized, so a 1 GiB bomb yields no files at all and would be invisible to a per-member accounting |
+| Malicious member names (NUL, lone surrogates) | Medium | Reject names containing NUL or failing a strict UTF-8 round-trip — `tarfile`'s `surrogateescape` decoding otherwise leaks raw bytes | **Implemented** — `app/fetch/archive._check_member_name`. A NUL is reachable only through a pax `path` header; the ustar name field is NUL-terminated, so `tarfile` truncates there |
+| Archive with multiple root directories | Medium | Root must match `^[A-Za-z0-9._-]+-[0-9a-f]{7,40}$` and be identical across all members | **Implemented** — `app/fetch/archive.ROOT_PATTERN` and the root-equality check in `iter_source_files`. Applied to regular files; directory and link members are skipped before it, which is safe only because nothing is written |
 | Future disk I/O reintroducing traversal | Medium | `security/path_safety.safe_relative_path()` (realpath + `commonpath`) **is to be** implemented and tested even though nothing currently writes files. The module does not exist yet | Planned |
 
 ### Malicious repository code
@@ -74,11 +74,11 @@ Every control below is **`Planned`** unless its Status cell says otherwise.
 
 | Threat | Risk | Mitigation | Status |
 |---|---|---|---|
-| Huge repository | High | GitHub-reported size preflight (256 MiB) before download; compressed cap 64 MiB; extracted cap 256 MiB | **Partial** — the preflight is `app/fetch/github.get_repo_metadata`, reading `MAX_REPO_API_SIZE_KB` at call time and refusing before any download URL is resolved. The compressed and extracted caps are the archive reader's job and do not exist |
-| Huge individual file | Medium | 2 MiB member cap, 1 MiB parse cap | Planned |
-| Thousands of files / deep nesting | Medium | 50 000 archive members, 3 000 parsed source files, depth 32, path length 1024 | Planned |
+| Huge repository | High | GitHub-reported size preflight (256 MiB) before download; compressed cap 64 MiB; extracted cap 256 MiB | **Implemented** — the preflight is `app/fetch/github.get_repo_metadata`; the compressed cap is `app/fetch/archive._CountingRawStream` (enforced eagerly as bytes arrive, so it bounds bandwidth and the adapter's own buffer) and the extracted cap is `_DecompressedStream` |
+| Huge individual file | Medium | 2 MiB member cap, 1 MiB parse cap | **Partial** — the 2 MiB member cap is `app/fetch/archive.iter_source_files`; an oversized member is skipped, not fatal. The 1 MiB parse cap belongs to the parser, which does not exist |
+| Thousands of files / deep nesting | Medium | 50 000 archive members, 3 000 parsed source files, depth 32, path length 1024 | **Partial** — the member cap, depth cap, and path-length cap are `app/fetch/archive.iter_source_files`. Depth and length are measured on the path *after* the archive root is stripped, so they do not vary with the repository's name. The 3 000-file parse cap belongs to the analysis pipeline |
 | Unbounded graph | Medium | 6 000 node / 20 000 edge caps; truncation is deterministic and flagged in stats, never silent | Planned |
-| Slow-loris or endless analysis | High | Cooperative `Deadline` (60s) checked between members, between files, and inside the parser. `asyncio.wait_for` cannot kill a thread, so the deadline — not the timeout — is the real mechanism | Planned |
+| Slow-loris or endless analysis | High | Cooperative `Deadline` (60s) checked between members, between files, and inside the parser. `asyncio.wait_for` cannot kill a thread, so the deadline — not the timeout — is the real mechanism | **Partial** — `app/analysis/deadline.py` exists (monotonic, frozen so a step cannot extend its own budget) and is checked between archive members by `app/fetch/archive.iter_source_files`. The between-files and in-parser checks, and the request-scoped construction, do not exist |
 | Request flooding | High | Per-IP sliding window (5/min, 60/hour on analyze) plus a global concurrency semaphore (3) with a fast 503 | Planned |
 | Oversized request body | Medium | 4 KiB cap enforced by ASGI middleware checking `content-length` **and** counting bytes on chunked bodies (Starlette does not cap bodies) | Planned |
 | Event loop starvation by CPU-bound parsing | Medium | Analysis runs on a worker thread so health checks and the rate limiter stay responsive | Planned |
@@ -127,6 +127,8 @@ Intended user-facing statement, valid only once ADR-003 and ADR-007 are actually
 
 > Repository contents are processed in memory for analysis and are not written to disk or stored.
 
+ADR-003's half is now real for the ingestion path: `app/fetch/archive.py` streams the tarball through `gzip` and `tarfile` and yields member bytes, and it opens no file and imports no `os`, `pathlib.Path`, `shutil`, or `tempfile`. The claim still cannot be published, because nothing downstream of it exists — the parser, the graph builder, and the routes could each reintroduce a write.
+
 Do not publish this claim before verifying the implementation. Do not claim stronger guarantees than the code provides.
 
 ## Security Testing
@@ -144,4 +146,18 @@ Done — `backend/tests/test_url_validation.py`, `backend/tests/test_net_guard.p
 - Preflight behaviour: the `403`/`404` collapse (byte-identical bodies), the size refusal (including at the exact limit and with the limit tightened through the environment), a malformed or hostile `/repos` body — wrong types, missing fields, a repository name of `../../etc/passwd`, a `default_branch` of `..` — and a hostile owner/repo/ref asserted to never reach the wire at all.
 - The 12 controls in `app/fetch/github.py` were **mutation-tested**, one deletion at a time: all 12 are caught. The first pass had one survivor — removing the redirect-status check still failed on the missing `Location`, so a `200 OK` carrying a `Location` would have been treated as a download target. A test for exactly that was added.
 
-Still required: archive traversal, symlinks, hardlinks, bombs, and malformed names; secret filtering as an end-to-end invariant over the whole response; parser robustness on truncated, binary, and pathological input; limit enforcement; rate limiting and concurrency; and an assertion that **no error body ever contains a traceback, a filesystem path, or a token**.
+Done — `backend/tests/test_archive.py` and `backend/tests/test_deadline.py` (136 cases), over archives built by `backend/tests/fixtures/tarballs.py`:
+
+- Traversal in every spelling: `../../etc/passwd`, `..\..\x`, mixed `src\../../evil.ts`, `.` and empty components, and — the case that matters most — backslashes *below* the root directory, where the root-name pattern offers no cover.
+- Symlinks, hardlinks, character and block devices, and FIFOs: each is skipped while a real file beside it is still yielded, so "skipped" is proven distinct from "aborted the archive".
+- Absolute paths: POSIX, `C:\`, `c:/`, and UNC `\\server\share`.
+- Malformed names: a NUL delivered through a pax `path` header, and lone surrogates from undecodable header bytes — plus two tests that assert the *fixtures* really produce a NUL and really write raw `\xff`, so the attack tests cannot pass by accident on a clean archive. A valid non-ASCII name is asserted to be **accepted**, because the rule is "decodable", not "ASCII".
+- Roots: nine rejected root shapes, a second root, and a well-formed second root.
+- Bombs: a 1 GiB payload of zeros rejected after reading under half of a 1 MiB compressed archive, asserted to raise the *ratio* error rather than the extracted-size one, so the test would notice if it were the 256 MiB cap doing the work. Alongside it, two tests that the guard does **not** fire below the floor, since ordinary source compresses well past 100:1 in the first few kilobytes.
+- Every cap: compressed download, extracted total, member count (including a real 50 000-member archive), member size, path depth, and path length — each with an at-the-limit case, and each in isolation with the other guards lifted so a test cannot pass on the wrong control.
+- Streaming behaviour: abandoning the generator after one file is asserted to leave most of the archive unread, and the download cap is asserted to trip having pulled no more than the cap plus one chunk. Both use incompressible filler, because a megabyte of `b"x"` arrives in the decompressor's first read and makes such assertions vacuous.
+- Malformed streams: empty input, non-gzip, gzip of garbage, truncated archive, truncated mid-member, and a header declaring more bytes than the archive contains. None escapes as a bare `TarError`, `EOFError`, or `zlib.error`.
+- The rejection body is asserted byte-identical across different hostile paths, and asserted not to contain them.
+- The 24 controls in `app/fetch/archive.py` were **mutation-tested**, one deletion at a time: 21 caught. The three survivors are documented in the code — the absolute-path check is subsumed by the empty-component and root-name checks, and a negative member size is unreachable because `tarfile` raises on the offset first. The first pass had a fourth survivor that was **not** redundant: deleting the `\` → `/` normalization left the suite green, because every backslash case then in the suite failed on the root-name pattern instead. Cases with backslashes below the root were added and the mutation is now caught.
+
+Still required: secret filtering as an end-to-end invariant over the whole response; parser robustness on truncated, binary, and pathological input; node/edge and file-count limit enforcement; rate limiting and concurrency; and an assertion that **no error body ever contains a traceback, a filesystem path, or a token**.

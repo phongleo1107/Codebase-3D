@@ -12,14 +12,15 @@ Priority order: security → correctness → core functionality → performance 
 - [x] `app/security/net_guard.py` + tests (host equality allowlist, resolved-IP check, redirect chain) — 389 cases across the two files; `tests/conftest.py` blocks the network for the whole session
 - [x] `app/fetch/github.py` — the client that finally *calls* the guard: `follow_redirects=False`, one hop through `validate_download_url`, `assert_public_ip` before connecting, `trust_env=False`, and **no `Authorization` on the codeload request** — 88 tests, all 12 controls mutation-tested. The credential assertion the net_guard task left owing is written and passing (ADR-009)
 
+- [x] `app/fetch/archive.py` + `app/analysis/deadline.py` + in-process malicious-tarball fixtures — traversal (incl. backslash spellings), symlinks, hardlinks, devices, bombs, malformed names, multi-root, and every resource cap — 136 tests, 24 controls mutation-tested
+
 ## Next
 
-- [ ] `app/fetch/archive.py` + in-process malicious-tarball fixtures — traversal, symlinks, hardlinks, bombs, malformed names, multi-root
 - [ ] `app/security/secret_filter.py` + `path_safety.py` + tests
 - [ ] Verify the tree-sitter spike — ABI load (**done: ABI 14**) and `QueryCursor` API (**done: imports**); `progress_callback` signature still unverified, confirm before writing the extractor
 - [ ] `app/analysis/parser.py` — import extraction, incl. negative cases regex would get wrong
 - [ ] `app/analysis/resolver.py` + `jsonc.py` — extensions, index files, `.js`→`.ts`, tsconfig `paths`, workspaces
-- [ ] `app/analysis/graph_builder.py` + `pipeline.py` + deadline plumbing
+- [ ] `app/analysis/graph_builder.py` + `pipeline.py` — `Deadline` exists (`app/analysis/deadline.py`); the pipeline that constructs one per request does not
 - [ ] `app/api/` — routes, body-size middleware, rate limiter, concurrency gate, error handlers. Map `RequestValidationError` to a bare `INVALID_REQUEST`: pydantic's `detail` embeds the offending input
 - [ ] Decide `Retry-After` on 429. `AppError.__init__` takes no arguments by design (nothing dynamic can reach a body), so the header must be set by the rate limiter at the response layer, not carried on the exception
 - [ ] `POST /api/source` + HMAC tokens
