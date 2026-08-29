@@ -41,7 +41,8 @@ filterwarnings = ["error"]
 [tool.ruff]
 # target-version is inferred from project.requires-python.
 line-length = 100
-src = ["app", "tests"]
+# Project root: makes `app` first-party for import sorting.
+src = ["."]
 
 [tool.ruff.lint]
 select = [
@@ -60,8 +61,9 @@ select = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Assertions are the point of a test file.
-"tests/**" = ["S101"]
+# Assertions are the point of a test file, and redaction tests need
+# hardcoded *fake* credentials to scrub.
+"tests/**" = ["S101", "S105", "S106"]
 
 [tool.mypy]
 python_version = "3.14"

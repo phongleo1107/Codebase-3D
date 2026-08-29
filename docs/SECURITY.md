@@ -1,6 +1,8 @@
 # Security Model
 
-> **No security control in this document is implemented.** The repository contains no source code as of 2026-08-29. Every row in the control tables reads `Planned`. Flip a row to `Implemented` only when you have seen the code, and name the file that implements it in the same edit.
+> **Almost no security control in this document is implemented.** As of 2026-08-29 only the backend contract layer exists (config, errors, models, logging) — there is no network, archive, parsing, or routing code, so every ingestion and resource-limit control below is still `Planned`. Rows marked `Implemented` name the file; treat every other row as aspirational. Flip a row only when you have seen the code, and name the file in the same edit.
+>
+> Note in particular that the limit *constants* now exist in `app/config.py`. **A constant is not a control.** Every row describing enforcement of a download, extraction, ratio, count, or duration limit stays `Planned` until code reads that constant and rejects something.
 
 ## Trust Model
 
@@ -22,7 +24,7 @@ The operator's environment (server filesystem, network position, `GITHUB_TOKEN`)
 
 ## Threats and Controls
 
-Every control below is **`Planned`**.
+Every control below is **`Planned`** unless its Status cell says otherwise.
 
 ### Network / SSRF
 
@@ -95,7 +97,8 @@ Every control below is **`Planned`**.
 | Threat | Risk | Mitigation | Status |
 |---|---|---|---|
 | Returning `.env`, keys, credentials | High | Deterministic secret-path filter applied during analysis **and** re-applied independently in `/api/source` from the same shared module, so a forged token still cannot extract them | Planned |
-| Token in logs or error bodies | High | Log filter redacting `ghp_…`, `github_pat_…`, and `Authorization` values; `GITHUB_TOKEN` held as `SecretStr` | Planned |
+| Token in logs or error bodies | High | Log filter redacting all GitHub token families (`ghp_ ghs_ gho_ ghu_ ghr_`, `github_pat_…`) and `Authorization` values in every shape they get logged in, including the `[('authorization', 'Bearer …')]` sequence form `httpx.Headers.items()` produces; `GITHUB_TOKEN` and `SOURCE_TOKEN_SECRET` held as `SecretStr` | **Implemented** — `app/logging_setup.py`, `app/config.py` |
+| Secret echoed by a settings `ValidationError` at startup | Medium | `Settings` uses `extra="ignore"`. Under `BaseSettings`' inherited `extra="forbid"`, an unrelated `.env` key aborts startup and pydantic prints the offending *value*; that traceback goes to stderr via the default excepthook, which no logging filter can intercept | **Implemented** — `app/config.py` |
 | Source code in logs | Medium | Never log file contents or import specifiers (both are repository content). Paths only at `DEBUG`, off by default | Planned |
 | Private-repo existence oracle | Medium | GitHub `403` and `404` both map to one opaque `REPOSITORY_NOT_FOUND` | Planned |
 | Secrets in frontend code | High | No token ever reaches the client; GitHub is contacted only server-side | Planned |
@@ -104,7 +107,7 @@ Every control below is **`Planned`**.
 
 | Threat | Risk | Mitigation | Status |
 |---|---|---|---|
-| Stack traces / filesystem paths in responses | Medium | Fixed body shape `{"error": {code, message, requestId}}`; unhandled exceptions return only a request ID, with the traceback logged server-side | Planned |
+| Stack traces / filesystem paths in responses | Medium | Fixed body shape `{"error": {code, message, requestId}}`; unhandled exceptions return only a request ID, with the traceback logged server-side | **Partial** — the contract exists in `app/errors.py` (static messages; `AppError.__init__` takes no arguments, so dynamic detail cannot reach a body). No FastAPI exception handler exists yet, so nothing actually returns it |
 | Pydantic validation echoing user input | Medium | `RequestValidationError` mapped to a generic 422 — never return Pydantic's `detail`, which embeds the offending input | Planned |
 
 ### Supply chain

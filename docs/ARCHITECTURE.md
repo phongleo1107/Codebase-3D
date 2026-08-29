@@ -1,6 +1,6 @@
 # Architecture
 
-> **Build status: nothing in this document is implemented.** As of 2026-08-29 the repository contains no source code. This is the agreed *target* design, recorded so it survives across sessions. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
+> **Build status: only the backend contract layer is implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, and `app/logging_setup.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
 >
 > Legend: `Planned` · `In progress` · `Implemented`
 
@@ -27,20 +27,24 @@ Frontend  →  POST /api/source { repository_url, commit_sha, path, token }
           →  raw.githubusercontent.com @ pinned SHA  →  read-only viewer
 ```
 
-## Backend — `backend/` · *Planned*
+## Backend — `backend/` · *In progress*
 
 Python 3.14, FastAPI, Pydantic v2 (pure v2 only — `pydantic.v1` is incompatible with 3.14).
 
-| Module | Responsibility |
-|---|---|
-| `app/config.py` | `Settings` + every limit constant |
-| `app/errors.py` | Error code enum, `AppError` hierarchy, response mapping |
-| `app/logging_setup.py` | JSON logs + redaction filter |
-| `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate |
-| `app/models/` | Pydantic request/response schemas |
-| `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens |
-| `app/fetch/` | GitHub client, streaming archive reader |
-| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder |
+| Module | Responsibility | Status |
+|---|---|---|
+| `app/config.py` | `Settings` + every limit constant | Implemented |
+| `app/errors.py` | Error code enum, `AppError` hierarchy, response mapping | Implemented |
+| `app/logging_setup.py` | JSON logs + redaction filter | Implemented |
+| `app/models/` | Pydantic request/response schemas | Implemented |
+| `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate | Planned |
+| `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | Planned |
+| `app/fetch/` | GitHub client, streaming archive reader | Planned |
+| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder | Planned |
+
+Limits live in `Settings` and nowhere else — request models read them through
+`get_settings()` at validation time rather than restating a number, so
+tightening a limit in the environment is actually enforced at the boundary.
 
 ### Repository ingestion · *Planned*
 
@@ -64,13 +68,15 @@ Resolution is pure set-membership against the file list observed in the archive 
 
 **External packages are not graph nodes** (ADR-005). They are recorded as counts on the importing file node and aggregated into stats.
 
-### Graph model · *Planned*
+### Graph model · *Implemented* — `app/models/graph.py`, `app/models/api.py`
 
 Matches the PRD contract. `type` is `"directory" | "file"`; `relationship` is `"imports"`. Directory hierarchy travels on a **`parent` field on the node**, not on edges (ADR-006), so `stats.dependencies == len(edges)` holds exactly.
 
 Nodes carry the metadata the frontend needs to size and color without recomputation: `bytes`, `loc`, `language`, `imports`, `importedBy`, `depth`, and for directories `fileCount` / `totalBytes`.
 
-Output is deterministic — nodes sorted by path, edges sorted by `(source, target)`, deduped, self-edges dropped. The same commit produces byte-identical JSON, which is what makes golden-file tests possible.
+Every model sets `extra="forbid"`. `parent` is required rather than defaulted — the analyzer must state it for every node, with `None` reserved for the root.
+
+Output is deterministic — nodes sorted by path, edges sorted by `(source, target)`, deduped, self-edges dropped. The same commit produces byte-identical JSON, which is what makes golden-file tests possible. **The models cannot enforce that**: sorting, dedup, and the `stats.dependencies == len(edges)` invariant are the graph builder's job, and it does not exist yet.
 
 ## Frontend — `frontend/` · *Planned*
 
@@ -105,7 +111,9 @@ Two phases, both in a Web Worker, then frozen (ADR-004): deterministic nested-sp
 | `POST /api/source` | `{repository_url, commit_sha, path, token}` → single file content |
 | `GET /api/health` | Liveness |
 
-Errors are always `{"error": {"code", "message", "requestId"}}`. `POST` is used for source so repository paths never reach access logs or a `Referer` header.
+Errors are always `{"error": {"code", "message", "requestId"}}` — exactly those three keys. `POST` is used for source so repository paths never reach access logs or a `Referer` header.
+
+The error contract is implemented in `app/errors.py`: 14 codes, each with a fixed HTTP status and a **static** message. `AppError.__init__` takes no arguments, so a call site structurally cannot attach a path or an upstream string that would end up in a response body. The routes and the exception handler that returns these bodies are not written yet.
 
 ## Security Boundaries · *Planned*
 
