@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     # --- GitHub -> analyzer boundary ---
     # The GitHub repos API reports `size` in KiB: 262_144 KiB == 256 MiB.
     MAX_REPO_API_SIZE_KB: int = 262_144
+    # Outbound HTTP. A hung upstream must not pin an analysis slot open until
+    # the 60s deadline expires, so both phases are bounded well below it.
+    GITHUB_CONNECT_TIMEOUT_S: float = 5.0
+    GITHUB_READ_TIMEOUT_S: float = 15.0
+    MAX_GITHUB_CONNECTIONS: int = 4
     MAX_DOWNLOAD_BYTES: int = 64 * 1024 * 1024
     MAX_EXTRACTED_BYTES: int = 256 * 1024 * 1024
     # Ratio guard trips only past the floor, so a tiny archive with one

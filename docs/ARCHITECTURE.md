@@ -1,6 +1,6 @@
 # Architecture
 
-> **Build status: the backend contract layer and the URL/egress security boundary are implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, and `app/security/net_guard.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
+> **Build status: the backend contract layer, the URL/egress security boundary, and the GitHub client are implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, and `app/fetch/github.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
 >
 > Legend: `Planned` · `In progress` · `Implemented`
 
@@ -39,20 +39,22 @@ Python 3.14, FastAPI, Pydantic v2 (pure v2 only — `pydantic.v1` is incompatibl
 | `app/models/` | Pydantic request/response schemas | Implemented |
 | `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate | Planned |
 | `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | **In progress** — `url_validation.py` and `net_guard.py` Implemented; secret filter, path safety, and HMAC tokens Planned |
-| `app/fetch/` | GitHub client, streaming archive reader | Planned |
+| `app/fetch/` | GitHub client, streaming archive reader | **In progress** — `github.py` Implemented (preflight + validated redirect); the streaming archive reader is Planned |
 | `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder | Planned |
 
 Limits live in `Settings` and nowhere else — request models read them through
 `get_settings()` at validation time rather than restating a number, so
 tightening a limit in the environment is actually enforced at the boundary.
 
-### Repository ingestion · *Planned*
+### Repository ingestion · *In progress*
 
-1. Preflight `GET /repos/{owner}/{repo}` → default branch, canonical case, size. Reject oversized repos before any archive byte moves. `404` and `403` collapse to one opaque error so a configured token cannot become a private-repo existence oracle.
-2. `GET /repos/{owner}/{repo}/tarball/{ref}` with `follow_redirects=False`.
-3. Validate the single redirect (see [SECURITY.md](SECURITY.md)), then re-request **without credentials**.
-4. Stream the gzip into `tarfile` in non-seeking mode (`r|gz`). **Nothing is written to disk** — see ADR-003.
-5. The commit SHA is harvested from the tar root directory name and pins all later source fetches.
+1. *Implemented* — Preflight `GET /repos/{owner}/{repo}` → default branch, canonical case, size. Reject oversized repos before any archive byte moves. `404` and `403` collapse to one opaque error so a configured token cannot become a private-repo existence oracle.
+2. *Implemented* — `GET /repos/{owner}/{repo}/tarball/{ref}` with `follow_redirects=False`.
+3. *Implemented* — Validate the single redirect (see [SECURITY.md](SECURITY.md)). The re-request is built **without credentials** by `download_request()`; sending it belongs to step 4.
+4. *Planned* — Stream the gzip into `tarfile` in non-seeking mode (`r|gz`). **Nothing is written to disk** — see ADR-003.
+5. *Planned* — The commit SHA is harvested from the tar root directory name and pins all later source fetches. That root name is authoritative: `get_download_url` returns a SHA only when the redirect target happens to pin one, which it does not for a branch ref (`.../legacy.tar.gz/refs/heads/main`).
+
+The token is never a client-level header — see ADR-009.
 
 ### Source parsing · *Planned*
 
@@ -120,10 +122,10 @@ The error contract is implemented in `app/errors.py`: 14 codes, each with a fixe
 Three trust transitions, each with an explicit validation layer:
 
 1. **Client → API** — URL grammar validation (`security/url_validation.py`, *Implemented*), request body cap, rate limit, concurrency gate (*Planned*).
-2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, **no caller yet**); download/extraction/ratio limits, per-member path rules, secret filter (*Planned*).
+2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, called on every hop by `fetch/github.py`); the size preflight (*Implemented*); download/extraction/ratio limits, per-member path rules, secret filter (*Planned*).
 3. **API → Browser** — zod validation with hard caps; source rendered as text nodes, never as an HTML string (*Planned*).
 
-The two implemented modules are pure functions: neither opens a socket, and the guard is only a control once `app/fetch/` calls it on every hop.
+The two `security/` modules are pure functions — neither opens a socket. `app/fetch/github.py` is what turns the guard into a control: it is the only module that opens one, and it calls both guard functions before returning any URL.
 
 Detail and threat mapping in [SECURITY.md](SECURITY.md).
 
@@ -132,7 +134,7 @@ Detail and threat mapping in [SECURITY.md](SECURITY.md).
 | Service | Use | Auth |
 |---|---|---|
 | `api.github.com` | Repo metadata, tarball redirect | Optional `GITHUB_TOKEN` (rate limits only) |
-| `codeload.github.com` | Tarball download | **None** — credentials deliberately withheld |
+| `codeload.github.com` | Tarball download | **None** — credentials deliberately withheld (ADR-009) |
 | `raw.githubusercontent.com` | Single-file source preview | None |
 
 No database, no cache server, no queue, no third-party analytics.

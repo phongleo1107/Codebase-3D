@@ -6,7 +6,7 @@
 
 **Current MVP goal:** the smallest product that feels genuinely impressive when someone pastes a repo URL and watches their codebase become a navigable 3D structure. V1 supports **TS/JS only**.
 
-> **Status: early implementation.** As of 2026-08-29 the backend has its contract layer (config, errors, models, logging) and its URL/egress security boundary, with 549 tests. There is still no routing, no network client, no parsing, and no frontend — so **nothing in the system can yet make an HTTP request**. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
+> **Status: early implementation.** As of 2026-08-29 the backend has its contract layer (config, errors, models, logging), its URL/egress security boundary, and the GitHub client, with 637 tests. There is still no routing, no archive reader, no parsing, and no frontend — so **the system can resolve a download URL but has never downloaded anything**. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
 
 **Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Three.js + React Three Fiber + Vite (frontend); Docker Compose (deploy). No database, no auth, no persistent storage.
 
@@ -29,7 +29,7 @@ PRD.md               Product spec — the source of requirements
 CLAUDE.md            This file
 .gitignore           Covers both stacks
 docs/                Project memory (see below)
-backend/             Python package — contract layer and security boundary only
+backend/             Python package — contract layer, security boundary, GitHub client
   pyproject.toml     Pinned deps; pytest, ruff and mypy config all live here
   uv.lock            Committed lockfile
   app/
@@ -38,8 +38,9 @@ backend/             Python package — contract layer and security boundary onl
     logging_setup.py JSON logs + redaction filter
     models/          Pydantic graph and API schemas
     security/        url_validation.py, net_guard.py — the rest still empty
-    api/ fetch/ analysis/   Empty packages
-  tests/             549 tests; conftest.py blocks the network suite-wide
+    fetch/           github.py — the only module that opens a socket
+    api/ analysis/   Empty packages
+  tests/             637 tests; conftest.py blocks the network suite-wide
 .claude/             Local Claude Code permissions (not source)
 ```
 
@@ -53,7 +54,7 @@ backend/             Python package — contract layer and security boundary onl
 | [SECURITY.md](docs/SECURITY.md) | Threat model and control status |
 | [TODO.md](docs/TODO.md) | Prioritized backlog |
 
-`frontend/` does not exist yet, and most modules ARCHITECTURE.md describes under `backend/app/` are still unwritten — `api/`, `fetch/`, and `analysis/` are empty placeholders, and `security/` holds two of its five planned modules. Create them as work begins, and update this section when you do.
+`frontend/` does not exist yet, and most modules ARCHITECTURE.md describes under `backend/app/` are still unwritten — `api/` and `analysis/` are empty placeholders, `fetch/` holds the client but not the archive reader, and `security/` holds two of its five planned modules. Create them as work begins, and update this section when you do.
 
 ## Development Rules
 

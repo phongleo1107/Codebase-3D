@@ -10,10 +10,10 @@ Priority order: security → correctness → core functionality → performance 
 - [x] `app/errors.py` + `app/models/` + `app/logging_setup.py` — API contract frozen; frontend work can start in parallel
 - [x] `app/security/url_validation.py` + tests (private IPs, homographs, userinfo, ports, `evil.com/github.com/o/r`)
 - [x] `app/security/net_guard.py` + tests (host equality allowlist, resolved-IP check, redirect chain) — 389 cases across the two files; `tests/conftest.py` blocks the network for the whole session
+- [x] `app/fetch/github.py` — the client that finally *calls* the guard: `follow_redirects=False`, one hop through `validate_download_url`, `assert_public_ip` before connecting, `trust_env=False`, and **no `Authorization` on the codeload request** — 88 tests, all 12 controls mutation-tested. The credential assertion the net_guard task left owing is written and passing (ADR-009)
 
 ## Next
 
-- [ ] `app/fetch/github.py` — the client that finally *calls* the guard: `follow_redirects=False`, one hop through `validate_download_url`, `assert_public_ip` before connecting, `trust_env=False`, and **no `Authorization` on the codeload request** (the last of these is the one piece of the net_guard task that could not be tested without the client)
 - [ ] `app/fetch/archive.py` + in-process malicious-tarball fixtures — traversal, symlinks, hardlinks, bombs, malformed names, multi-root
 - [ ] `app/security/secret_filter.py` + `path_safety.py` + tests
 - [ ] Verify the tree-sitter spike — ABI load (**done: ABI 14**) and `QueryCursor` API (**done: imports**); `progress_callback` signature still unverified, confirm before writing the extractor

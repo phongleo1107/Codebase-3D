@@ -4,11 +4,13 @@
 
 Build the MVP defined in [PRD.md](../PRD.md): paste a public GitHub URL → safely analyze a TS/JS repository → render its dependency graph in navigable 3D.
 
-Steps 1 and 2 of the build order are done and green: **the backend contract** (config, errors, models, logging) and **the URL/egress security boundary** (`security/url_validation.py`, `security/net_guard.py`). Both landed before any code capable of making a network request exists — which is still true: nothing calls the egress guard yet.
+Steps 1-3 of the build order are done and green: **the backend contract** (config, errors, models, logging), **the URL/egress security boundary** (`security/url_validation.py`, `security/net_guard.py`), and **the GitHub client** (`fetch/github.py`) — the first module in the project that can open a socket, and the guard's first caller.
+
+It resolves a download URL; it does not download. No archive byte has ever been fetched by this codebase.
 
 ## Working
 
-**The backend contract layer, the security boundary, and their tests.** There is still no routing, network, parsing, or analysis code: `app/api/`, `app/fetch/`, and `app/analysis/` remain empty packages, and `app/security/` holds two of its five planned modules.
+**The backend contract layer, the security boundary, the GitHub client, and their tests.** There is still no routing, parsing, or analysis code: `app/api/` and `app/analysis/` remain empty packages, `app/fetch/` holds the client but not the archive reader, and `app/security/` holds two of its five planned modules.
 
 | Path | Notes |
 |---|---|
@@ -24,10 +26,12 @@ Steps 1 and 2 of the build order are done and green: **the backend contract** (c
 | `backend/app/models/` | `graph.py`, `api.py`, re-exporting `__init__.py` |
 | `backend/app/logging_setup.py` | JSON-line formatter + `RedactingFilter` |
 | `backend/app/security/url_validation.py` | `parse_github_url` → frozen `RepoRef`; strict grammar, ASCII-only, allowlisted host |
-| `backend/app/security/net_guard.py` | `validate_download_url` (equality allowlist) + `assert_public_ip` (resolved-IP check). **Nothing calls either yet** |
+| `backend/app/security/net_guard.py` | `validate_download_url` (equality allowlist) + `assert_public_ip` (resolved-IP check). Both are now called by `fetch/github.py` on every redirect |
+| `backend/app/fetch/github.py` | `create_client` (`follow_redirects=False`, `trust_env=False`, no `Authorization` default), `get_repo_metadata` (preflight, size gate, 403/404 collapse), `get_download_url` (validated single hop), `download_request` (the credential-free download GET) |
 | `backend/tests/conftest.py` | Session-scoped autouse fixture blocking `getaddrinfo`, `gethostbyname`, `create_connection`, and `socket.connect`/`connect_ex`. Raises `NetworkAccessAttempted`, a `RuntimeError` — deliberately *not* an `OSError`, so it travels straight through `assert_public_ip`'s handler instead of being swallowed as a rejection |
-| `backend/tests/` | 549 tests across config, errors, models, logging, URL validation, net guard |
-| `backend/app/{api,fetch,analysis}/` | Still empty packages |
+| `backend/tests/` | 637 tests across config, errors, models, logging, URL validation, net guard, GitHub client |
+| `backend/app/{api,analysis}/` | Still empty packages |
+| `backend/app/fetch/archive.py` | Not written — the streaming tarball reader is the next task |
 | `backend/app/security/` | `secret_filter.py`, `path_safety.py`, HMAC tokens still to come |
 | `.claude/settings.local.json` | Local tool permissions, not source |
 
@@ -36,7 +40,7 @@ No `frontend/`, no Docker files, no CI.
 **Verified locally on 2026-08-29** (Python 3.14.7, uv 0.12.3):
 
 - `uv sync` resolves and installs cleanly; the project installs as an editable package.
-- `uv run pytest` → **549 passed**. `uv run mypy` (strict) → clean over 21 files. `uv run ruff check .` → clean.
+- `uv run pytest` → **637 passed**. `uv run mypy` (strict) → clean over 23 files. `uv run ruff check .` → clean.
 - tree-sitter ABI spike printed **`14`**, and `QueryCursor` imports successfully alongside `Language`, `Parser`, and `Query`.
 
 Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was `["app", "tests"]`, which pointed *inside* the package so isort never treated `app` as first-party), and `S105`/`S106` added to the test per-file-ignores because redaction tests must hardcode fake credentials.
@@ -55,6 +59,19 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 - The pydantic **mypy plugin is not enabled** (no `plugins` key in `[tool.mypy]`). Constructor type-checking still works via PEP 681 `@dataclass_transform` on pydantic's metaclass. Reviewed and judged unnecessary; do not assume the plugin is present when reading type errors.
 
 ## Recently Completed
+
+- **2026-08-29** — **GitHub client implemented**: `app/fetch/github.py` plus 88 tests, and three new `Settings` fields (`GITHUB_CONNECT_TIMEOUT_S`, `GITHUB_READ_TIMEOUT_S`, `MAX_GITHUB_CONNECTIONS` — timeouts are operational limits, so they live in `Settings` like every other one). This is the first module that can open a socket and the first caller of the egress guard. `docs/SECURITY.md` gained four `Implemented` rows (Arbitrary URL, Redirect to attacker host, Proxy env vars, Credential leak) plus the private-repo-oracle row, and two `Partial` ones (Huge repository, the two command-injection rows).
+
+  **The assertion the net_guard task left owing is now written and passing**: both requests run through one client with a token configured, and the codeload request is asserted bare — under the header name, and by searching every header value for the token.
+
+  Decisions and non-obvious behaviours worth carrying forward:
+  - **The token is a per-request header, never a client default** (ADR-009). The brief suggested setting it on the client and deleting it before the download; that makes the credential's absence depend on a `del` a refactor can drop. With no client-level header there is nothing to inherit, so a request carries the token only if a call site names it — and the only one that does targets `api.github.com`. `download_request()` still pops an inherited header, for a client this module did not build.
+  - **`get_download_url` returns `(url, sha | None)`, not `(url, sha)`.** GitHub redirects a *branch* ref to `.../legacy.tar.gz/refs/heads/main`, which pins no commit; only a SHA-shaped ref produces one. The authoritative SHA still comes from the tar root during extraction, as ARCHITECTURE.md always said. Returning a fabricated or empty string here would have quietly become a wrong commit pin in `/api/source`.
+  - **A `Location` header is only honoured on a redirect status.** Mutation testing found this: deleting the status check left the whole suite green, because every non-redirect test case happened to omit `Location`. A `200 OK` carrying one would have been read as a download target. `304` is why the accepted set is enumerated rather than `300 <= status < 400`.
+  - **`isinstance(value, bool)` before `isinstance(value, int)`**, because `bool` subclasses `int`: an unguarded integer check would accept `private: 0` and a size field of `True`.
+  - **Percent-encoding a path segment is not validation.** `..` is entirely unreserved characters, so `quote("..", safe="")` returns `..` unchanged. Owner, repo, and every ref component are checked against a fixed character set *before* being encoded, and a hostile value is asserted never to reach the wire rather than merely to be encoded on the way out.
+  - GitHub's canonical `name`/`owner.login` are re-validated on the way *in*. They are upstream data that gets interpolated into the tarball URL and later into node paths; the API being trustworthy today is not the same as the response being structurally constrained.
+  - The **12 controls in the module were mutation-tested one deletion at a time; all 12 are caught** (11 on the first pass, plus the redirect-status check after its test was added).
 
 - **2026-08-29** — **URL validation and the network guard implemented**: `app/security/url_validation.py`, `app/security/net_guard.py`, `tests/conftest.py`, plus 389 tests. `docs/SECURITY.md`'s Network/SSRF table moved from all-`Planned` to four `Implemented` rows and two `Partial` ones; the `Partial` halves are client behaviour (`follow_redirects=False`, the one-hop rule, no `Authorization` on the codeload request) and stay `Planned` until `app/fetch/` exists.
 
@@ -89,9 +106,8 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 
 ## Next Steps
 
-1. Implement `fetch/github.py` — the first code that can actually make a request, and the first caller of the guard. It must use `follow_redirects=False`, pass every `Location` through `validate_download_url`, call `assert_public_ip` before connecting, set `trust_env=False`, and send **no `Authorization` header** on the codeload request. That last assertion is the one piece of the net_guard task that could not be written without the client, and it is still owed.
-2. Implement `fetch/archive.py` with in-process malicious-tarball fixtures (`io.BytesIO`), covering traversal, symlinks, bombs, and malformed names. Still no network.
-3. When routes land, wire `AppError` into a FastAPI exception handler and map `RequestValidationError` to a bare `INVALID_REQUEST` — pydantic's `detail` embeds the offending input and must never be returned.
+1. Implement `fetch/archive.py` with in-process malicious-tarball fixtures (`io.BytesIO`), covering traversal, symlinks, bombs, and malformed names. Still no network.
+2. When routes land, wire `AppError` into a FastAPI exception handler and map `RequestValidationError` to a bare `INVALID_REQUEST` — pydantic's `detail` embeds the offending input and must never be returned.
 
 The ABI half of the tree-sitter spike is **done** (see above). The `progress_callback` signature on `Parser.parse()` is still unverified and must be confirmed before the extractor is written.
 
