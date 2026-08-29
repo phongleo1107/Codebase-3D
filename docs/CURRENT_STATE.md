@@ -4,13 +4,15 @@
 
 Build the MVP defined in [PRD.md](../PRD.md): paste a public GitHub URL → safely analyze a TS/JS repository → render its dependency graph in navigable 3D.
 
-Steps 1-4 of the build order are done and green: **the backend contract** (config, errors, models, logging), **the URL/egress security boundary** (`security/url_validation.py`, `security/net_guard.py`), **the GitHub client** (`fetch/github.py`) — the first module in the project that can open a socket — and **the streaming archive reader** (`fetch/archive.py`).
+Steps 1-4 of the build order are done and green: **the backend contract** (config, errors, models, logging), **the URL/egress security boundary** (`security/url_validation.py`, `security/net_guard.py`), **the GitHub client** (`fetch/github.py`) — the first module in the project that can open a socket — and **the streaming archive reader** (`fetch/archive.py`). Two further security modules, **`security/secret_filter.py`** and **`security/path_safety.py`**, are implemented and tested ahead of their call sites.
 
 **The two halves of ingestion are not joined.** `github.py` builds the credential-free download request but never sends it; `archive.py` consumes a byte iterator that, so far, has only ever come from a test fixture. No archive byte has been fetched over a network by this codebase.
 
+**And two security modules are unwired.** `is_secret_path` and `safe_relative_path` are correct and mutation-tested, and **nothing calls either one**. No `.env` is filtered today, because there is no analysis pass and no `/api/source` to filter it out of. Do not read their presence as protection.
+
 ## Working
 
-**The backend contract layer, the security boundary, the GitHub client, the archive reader, and their tests.** There is still no routing, parsing, or analysis code: `app/api/` remains an empty package, `app/analysis/` holds only `deadline.py`, and `app/security/` holds two of its five planned modules.
+**The backend contract layer, the security boundary, the GitHub client, the archive reader, and their tests.** There is still no routing, parsing, or analysis code: `app/api/` remains an empty package, `app/analysis/` holds only `deadline.py`, and `app/security/` holds four of its five planned modules.
 
 | Path | Notes |
 |---|---|
@@ -29,12 +31,14 @@ Steps 1-4 of the build order are done and green: **the backend contract** (confi
 | `backend/app/security/net_guard.py` | `validate_download_url` (equality allowlist) + `assert_public_ip` (resolved-IP check). Both are now called by `fetch/github.py` on every redirect |
 | `backend/app/fetch/github.py` | `create_client` (`follow_redirects=False`, `trust_env=False`, no `Authorization` default), `get_repo_metadata` (preflight, size gate, 403/404 collapse), `get_download_url` (validated single hop), `download_request` (the credential-free download GET) |
 | `backend/app/fetch/archive.py` | `iter_source_files` — streams the download through `_CountingRawStream` → `gzip` → `_DecompressedStream` → `tarfile("r|")`, yielding `(PurePosixPath, bytes)` per acceptable regular file. `Limits` is a no-default view onto `Settings` |
+| `backend/app/security/secret_filter.py` | `is_secret_path` — exact names, prefixes, extension suffixes, and excluded directories, matched case-insensitively over path components. Pure, no I/O. **No caller** |
+| `backend/app/security/path_safety.py` | `safe_relative_path` — realpath the base *and* the candidate, then require `commonpath` to equal the base. Raises `ValueError`, never an `AppError` (it is a utility, not an HTTP boundary). **No caller**, by design |
 | `backend/app/analysis/deadline.py` | `Deadline` — frozen, monotonic; `check()` raises `AnalysisTimeoutError` |
 | `backend/tests/fixtures/tarballs.py` | `make_tar`, `make_source_tar`, `make_member_with_name`, `make_pax_name`, `make_symlink_member`, `make_hardlink_member`, `make_oversized_header`, `make_many_members`, `make_bomb`, `chunked`, `noise` |
 | `backend/tests/conftest.py` | Session-scoped autouse fixture blocking `getaddrinfo`, `gethostbyname`, `create_connection`, and `socket.connect`/`connect_ex`. Raises `NetworkAccessAttempted`, a `RuntimeError` — deliberately *not* an `OSError`, so it travels straight through `assert_public_ip`'s handler instead of being swallowed as a rejection |
-| `backend/tests/` | 773 tests across config, errors, models, logging, URL validation, net guard, GitHub client, archive reader, deadline |
+| `backend/tests/` | 915 tests across config, errors, models, logging, URL validation, net guard, GitHub client, archive reader, deadline, secret filter, path safety |
 | `backend/app/api/` | Still an empty package |
-| `backend/app/security/` | `secret_filter.py`, `path_safety.py`, HMAC tokens still to come |
+| `backend/app/security/` | HMAC tokens still to come |
 | `.claude/settings.local.json` | Local tool permissions, not source |
 
 No `frontend/`, no Docker files, no CI.
@@ -42,7 +46,7 @@ No `frontend/`, no Docker files, no CI.
 **Verified locally on 2026-08-29** (Python 3.14.7, uv 0.12.3):
 
 - `uv sync` resolves and installs cleanly; the project installs as an editable package.
-- `uv run pytest` → **773 passed** in ~6s. `uv run mypy` (strict) → clean over 29 files. `uv run ruff check .` → clean.
+- `uv run pytest` → **915 passed** in ~6s. `uv run mypy` (strict) → clean over 33 files. `uv run ruff check .` → clean.
 - tree-sitter ABI spike printed **`14`**, and `QueryCursor` imports successfully alongside `Language`, `Parser`, and `Query`.
 
 Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was `["app", "tests"]`, which pointed *inside* the package so isort never treated `app` as first-party), and `S105`/`S106` added to the test per-file-ignores because redaction tests must hardcode fake credentials.
@@ -56,6 +60,7 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 - No CI yet.
 - **The compression-ratio guard and the 50 000-member cap are in tension at the extreme.** An archive of 50 000 *empty* files is mostly zero padding: measured at ~25 MiB extracted from ~355 KiB compressed, a ratio of ~74 against a cap of 100. It passes today, but with under a 1.4× margin that no real repository approaches — ordinary source sits around 5:1. The 50 000-member test therefore lifts the ratio guard, so it tests the count cap alone rather than becoming a hostage to the zlib version. If a legitimate repository is ever refused as a bomb, this is the interaction to look at first; the fix is to raise `RATIO_FLOOR_BYTES` or to exclude header padding from the numerator, not to raise the ratio.
 - **`archive.py` never returns the commit SHA**, although it validates the archive root that carries it. ARCHITECTURE.md ingestion step 5 stays `Planned` for that reason. Nothing needs it until a pipeline exists, but do not read the root check as "the SHA is harvested".
+- **`secret_filter.py` and `path_safety.py` have no callers.** Both are correct and mutation-tested; neither protects anything yet, because the code that would apply them does not exist. Grepping for the module and finding it is not evidence that a `.env` is filtered — grep for the *call*.
 - **`assert_public_ip` narrows DNS rebinding, it does not close it.** The connection that follows is made by name, so a resolver that answers differently the second time is not caught. Closing it needs connect-by-IP with SNI, which v1 does not do. Recorded in `docs/SECURITY.md`.
 - **`ruff format` is not a project gate — do not run it.** `uv run ruff check .` is the gate and is clean. `ruff format --check` reports 5 of 21 files as unformatted: four pre-existing (`app/logging_setup.py`, `tests/test_config.py`, `tests/test_logging.py`, `tests/test_models.py`) and `app/security/net_guard.py`, which is unformatted for the same reason they are — the formatter wants to join wrapped constructs into lines that then exceed the configured `line-length = 100`. Running it would rewrite unrelated code to no benefit. Either adopt it repo-wide as a deliberate decision or leave it alone; do not apply it to one file.
 - The contract layer is unexercised by any route — nothing constructs an `AnalyzeResponse` from real data yet, so field *semantics* are only as good as the documentation.
@@ -63,6 +68,19 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 - The pydantic **mypy plugin is not enabled** (no `plugins` key in `[tool.mypy]`). Constructor type-checking still works via PEP 681 `@dataclass_transform` on pydantic's metaclass. Reviewed and judged unnecessary; do not assume the plugin is present when reading type errors.
 
 ## Recently Completed
+
+- **2026-08-29** — **Secret filter and path-safety guard implemented**: `app/security/secret_filter.py`, `app/security/path_safety.py`, plus 142 tests. `docs/SECURITY.md`'s "Future disk I/O reintroducing traversal" row moved to `Implemented`; the "Returning `.env`, keys, credentials" row moved to **`Partial`, not `Implemented`** — see below.
+
+  Decisions and non-obvious behaviours worth carrying forward:
+  - **The secret-exposure row is `Partial` on purpose.** The brief asked for `Implemented`, and the rule *is* implemented; but that row describes a filter "applied during analysis **and** re-applied independently in `/api/source`", and neither call site exists. SECURITY.md's own banner says a constant is not a control, and the last adversarial review caught a row falsely claiming `path_safety.py` was "implemented and tested" when the file did not exist. A rule nothing applies filters nothing. The row flips when both callers call it.
+  - **`server.*` is deliberately narrower than the brief.** Read literally it blocks `server.ts` and `server.js` — the most common Node entry point there is — which would delete a real node from the graph, dangle every inbound edge, and 403 a file the user can already read on GitHub. The pattern is aimed at TLS material, so it matches `server.` plus a credential extension (`.crt .cert .csr .der .jks .keystore`); `.pem`, `.key`, and `.p12` were already covered by the global suffix rule, so nothing is lost. Confirmed with the requester before deviating.
+  - **The allowed list is the load-bearing half of the spec.** Blocking secrets is easy; the failure mode that actually ships is a rule that eats source. `monkey.ts` and `keyboard.tsx` die to a substring search for `key`, `src/secrets.ts` dies if the exact-name rule becomes a prefix, `.gitignore` dies if the `.git` directory rule matches by prefix, and `src/build.ts` and a Bazel `BUILD` file die if the directory rules are applied to the final component instead of the parents only. Each is a test.
+  - **Directory rules match parents; name rules match every component.** The asymmetry is the reason `BUILD` survives while `.env/keys.ts` does not — a *file* named `build` is source, but a *directory* named `.env` shields nothing.
+  - **`casefold`, not `lower`.** Every difference between them widens the match, and the machine that produced the repository is frequently case-insensitive: `.ENV` and `ID_RSA` arrive intact and are exactly as sensitive.
+  - **`commonpath`, not `str.startswith`** — `startswith` accepts `/srv/base-evil` as a child of `/srv/base`, since the prefix matches but the component boundary does not. And **the base is realpath'd too**: `/tmp` is `/private/tmp` on macOS and `tmp_path` inherits that, so resolving only the candidate would refuse every legitimate call. Both are covered by a test and by a mutation.
+  - **An `if`, not an `assert`.** The brief said "assert the result stays inside base"; a real `assert` is stripped under `python -O`, which is exactly the deployment where the check still needs to hold.
+  - `path_safety` raises a plain `ValueError` rather than an `AppError`: it is a low-level utility, not an HTTP boundary, and its caller owns the mapping. Its three messages are fixed literals — the NUL check exists partly so `os.stat`'s own `ValueError`, which quotes the path, never surfaces.
+  - **The 12 controls in `secret_filter.py` and the 6 in `path_safety.py` were mutation-tested one deletion at a time; all 18 are caught**, including two *widening* mutations (directory rules applied to every component, and `commonpath` swapped for `startswith`). No survivors, so nothing needed a redundancy annotation.
 
 - **2026-08-29** — **Streaming archive reader implemented**: `app/fetch/archive.py`, `app/analysis/deadline.py`, `tests/fixtures/tarballs.py`, plus 136 tests. `docs/SECURITY.md`'s "Path traversal and archive attacks" table moved to five `Implemented` rows, and four resource-exhaustion rows moved to `Implemented` or `Partial`.
 
@@ -122,7 +140,7 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 
 ## Next Steps
 
-1. Implement `security/secret_filter.py` and `security/path_safety.py`.
+1. **Call `is_secret_path`.** It is written and unwired; the analysis pass and `/api/source` must each apply it independently, from this one module, before the SECURITY.md row can leave `Partial`.
 2. Write the pipeline that finally joins `github.py` to `archive.py` — it constructs one `Deadline` per request, sends `download_request()`, and feeds `response.iter_bytes()` to `iter_source_files`. It should also harvest the commit SHA from the archive root, which `archive.py` validates but does not currently return.
 3. When routes land, wire `AppError` into a FastAPI exception handler and map `RequestValidationError` to a bare `INVALID_REQUEST` — pydantic's `detail` embeds the offending input and must never be returned.
 

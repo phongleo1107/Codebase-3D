@@ -38,7 +38,7 @@ Python 3.14, FastAPI, Pydantic v2 (pure v2 only — `pydantic.v1` is incompatibl
 | `app/logging_setup.py` | JSON logs + redaction filter | Implemented |
 | `app/models/` | Pydantic request/response schemas | Implemented |
 | `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate | Planned |
-| `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | **In progress** — `url_validation.py` and `net_guard.py` Implemented; secret filter, path safety, and HMAC tokens Planned |
+| `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | **In progress** — `url_validation.py`, `net_guard.py`, `secret_filter.py`, `path_safety.py` Implemented; HMAC tokens Planned. The first two are called by `fetch/github.py`; the second two have **no callers**, since the analysis pass, `/api/source`, and all disk I/O are unwritten |
 | `app/fetch/` | GitHub client, streaming archive reader | **Implemented** — `github.py` (preflight + validated redirect) and `archive.py` (streaming extraction + member validation). Nothing calls both yet |
 | `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder | **In progress** — `deadline.py` Implemented; everything else Planned |
 
@@ -124,10 +124,10 @@ The error contract is implemented in `app/errors.py`: 14 codes, each with a fixe
 Three trust transitions, each with an explicit validation layer:
 
 1. **Client → API** — URL grammar validation (`security/url_validation.py`, *Implemented*), request body cap, rate limit, concurrency gate (*Planned*).
-2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, called on every hop by `fetch/github.py`); the size preflight (*Implemented*); download/extraction/ratio limits and per-member path rules (`fetch/archive.py`, *Implemented*); secret filter (*Planned*).
+2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, called on every hop by `fetch/github.py`); the size preflight (*Implemented*); download/extraction/ratio limits and per-member path rules (`fetch/archive.py`, *Implemented*); secret filter (`security/secret_filter.py`, *Implemented as a rule, not yet applied* — no analysis pass calls it).
 3. **API → Browser** — zod validation with hard caps; source rendered as text nodes, never as an HTML string (*Planned*).
 
-The two `security/` modules are pure functions — neither opens a socket. `app/fetch/github.py` is what turns the guard into a control: it is the only module that opens one, and it calls both guard functions before returning any URL.
+Every `security/` module is a pure function — none opens a socket, and `path_safety.py` is the only one that touches the filesystem (it resolves paths; it does not read or write). `app/fetch/github.py` is what turns the egress guard into a control: it is the only module that opens a socket, and it calls both guard functions before returning any URL. `secret_filter.py` and `path_safety.py` are waiting for the same treatment from the analysis pipeline and from whatever first needs disk.
 
 Detail and threat mapping in [SECURITY.md](SECURITY.md).
 
