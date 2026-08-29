@@ -14,9 +14,11 @@ merely asserted `AppError` would not notice the two swapping places.
 import gzip
 import io
 import tarfile
+import unicodedata
 from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import PurePosixPath
+from typing import Literal
 
 import pytest
 
@@ -369,6 +371,78 @@ def test_valid_non_ascii_member_name_is_accepted() -> None:
     # The rule is "decodable", not "ASCII". A repository may legitimately
     # contain UTF-8 filenames and rejecting them would be a bug, not a control.
     assert read(make_member_with_name(f"{ROOT}/café/日本語.ts")) == ["café/日本語.ts"]
+
+
+# --------------------------------------------------------------------------
+# Unicode normalization: the reader must not perform any
+# --------------------------------------------------------------------------
+#
+# A tar member name is bytes. `tarfile` decodes it but does not normalize it,
+# and neither does this module — the component check runs against the exact
+# code points from the header. That is the safe direction, and these tests pin
+# it, because normalizing would *create* the attack rather than defend against
+# one: under NFKC, U+FF0E FULLWIDTH FULL STOP folds to "." and U+FF0F FULLWIDTH
+# SOLIDUS folds to "/", so a name that is one inert component before
+# normalization becomes traversal after it.
+#
+# The exposure is therefore downstream, not here: anything that later
+# normalizes a yielded path — a filesystem with a normalizing layer, a
+# comparison that calls unicodedata.normalize, a database collation — undoes
+# the guarantee these tests assert.
+
+
+def test_fullwidth_lookalikes_are_not_folded_into_traversal() -> None:
+    """U+FF0E and U+FF0F stay ordinary characters, not "." and "/".
+
+    Both survive as a single component, so they are neither traversal nor a
+    separator. If this ever starts raising, something upstream began
+    normalizing and the traversal check is being handed different text than
+    the archive contained.
+    """
+    # Written as escapes, not literals: the characters are visually identical
+    # to "." and "/", which is the entire premise of the attack and makes them
+    # unreadable in a diff. U+FF0E FULLWIDTH FULL STOP, U+FF0F FULLWIDTH SOLIDUS.
+    name = "\uff0e\uff0e\uff0fetc\uff0fpasswd.ts"
+    assert unicodedata.normalize("NFKC", name) == "../etc/passwd.ts"
+    assert read(make_member_with_name(f"{ROOT}/{name}")) == [name]
+
+
+def test_fullwidth_solidus_does_not_split_a_component() -> None:
+    # The component count is the observable proof: one component, not three.
+    # A normalizing implementation would report depth 3 here.
+    name = "src\uff0fnested\uff0ffile.ts"
+    assert PurePosixPath(read(make_member_with_name(f"{ROOT}/{name}"))[0]).parts == (name,)
+
+
+@pytest.mark.parametrize("form", ["NFC", "NFD"])
+def test_decomposed_and_composed_names_are_preserved_verbatim(
+    form: Literal["NFC", "NFD"],
+) -> None:
+    """Both spellings of the same grapheme round-trip unchanged and distinctly.
+
+    A path yielded here becomes a graph node ID and the subject of an
+    /api/source token. Silently folding one spelling into the other would make
+    the ID disagree with the archive it came from, so the token would not
+    match the file the user clicked.
+    """
+    name = unicodedata.normalize(form, "café/résumé.ts")
+    yielded = read(make_member_with_name(f"{ROOT}/{name}"))
+    assert yielded == [name]
+    # Not merely equal after normalization — equal as code points.
+    assert yielded[0].encode("utf-8") == name.encode("utf-8")
+
+
+def test_the_two_spellings_are_different_paths() -> None:
+    # Guards the assertion above from being vacuous: if these two were equal,
+    # "preserved verbatim" would hold trivially for any implementation.
+    assert unicodedata.normalize("NFC", "café") != unicodedata.normalize("NFD", "café")
+
+
+def test_normalization_does_not_rescue_real_traversal() -> None:
+    # The mirror case. Actual ASCII ".." is still rejected when it sits beside
+    # characters that a normalizing reader might have been distracted by.
+    with pytest.raises(ArchiveRejectedError):
+        read(make_member_with_name(f"{ROOT}/café/../../etc/passwd"))
 
 
 # --------------------------------------------------------------------------

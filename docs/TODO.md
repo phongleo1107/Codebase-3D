@@ -12,7 +12,7 @@ Priority order: security → correctness → core functionality → performance 
 - [x] `app/security/net_guard.py` + tests (host equality allowlist, resolved-IP check, redirect chain) — 389 cases across the two files; `tests/conftest.py` blocks the network for the whole session
 - [x] `app/fetch/github.py` — the client that finally *calls* the guard: `follow_redirects=False`, one hop through `validate_download_url`, `assert_public_ip` before connecting, `trust_env=False`, and **no `Authorization` on the codeload request** — 88 tests, all 12 controls mutation-tested. The credential assertion the net_guard task left owing is written and passing (ADR-009)
 
-- [x] `app/fetch/archive.py` + `app/analysis/deadline.py` + in-process malicious-tarball fixtures — traversal (incl. backslash spellings), symlinks, hardlinks, devices, bombs, malformed names, multi-root, and every resource cap — 136 tests, 24 controls mutation-tested
+- [x] `app/fetch/archive.py` + `app/analysis/deadline.py` + in-process malicious-tarball fixtures — traversal (incl. backslash spellings), symlinks, hardlinks, devices, bombs, malformed names, multi-root, and every resource cap — 142 tests, 24 controls mutation-tested
 
 - [x] `app/security/secret_filter.py` + `path_safety.py` + tests — two golden lists plus a 20 000-path determinism sweep; path safety tested against real symlinks under `tmp_path`. 142 tests, all 18 controls mutation-tested. **Neither module has a caller** — wiring them is part of the two tasks below
 

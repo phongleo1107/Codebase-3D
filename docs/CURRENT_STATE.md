@@ -36,7 +36,7 @@ Steps 1-4 of the build order are done and green: **the backend contract** (confi
 | `backend/app/analysis/deadline.py` | `Deadline` — frozen, monotonic; `check()` raises `AnalysisTimeoutError` |
 | `backend/tests/fixtures/tarballs.py` | `make_tar`, `make_source_tar`, `make_member_with_name`, `make_pax_name`, `make_symlink_member`, `make_hardlink_member`, `make_oversized_header`, `make_many_members`, `make_bomb`, `chunked`, `noise` |
 | `backend/tests/conftest.py` | Session-scoped autouse fixture blocking `getaddrinfo`, `gethostbyname`, `create_connection`, and `socket.connect`/`connect_ex`. Raises `NetworkAccessAttempted`, a `RuntimeError` — deliberately *not* an `OSError`, so it travels straight through `assert_public_ip`'s handler instead of being swallowed as a rejection |
-| `backend/tests/` | 915 tests across config, errors, models, logging, URL validation, net guard, GitHub client, archive reader, deadline, secret filter, path safety |
+| `backend/tests/` | 921 tests across config, errors, models, logging, URL validation, net guard, GitHub client, archive reader, deadline, secret filter, path safety |
 | `backend/app/api/` | Still an empty package |
 | `backend/app/security/` | HMAC tokens still to come |
 | `.claude/settings.local.json` | Local tool permissions, not source |
@@ -46,7 +46,7 @@ No `frontend/`, no Docker files, no CI.
 **Verified locally on 2026-08-29** (Python 3.14.7, uv 0.12.3):
 
 - `uv sync` resolves and installs cleanly; the project installs as an editable package.
-- `uv run pytest` → **915 passed** in ~6s. `uv run mypy` (strict) → clean over 33 files. `uv run ruff check .` → clean.
+- `uv run pytest` → **921 passed** in ~5s. `uv run mypy` (strict) → clean over 33 files. `uv run ruff check .` → clean.
 - tree-sitter ABI spike printed **`14`**, and `QueryCursor` imports successfully alongside `Language`, `Parser`, and `Query`.
 
 Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was `["app", "tests"]`, which pointed *inside* the package so isort never treated `app` as first-party), and `S105`/`S106` added to the test per-file-ignores because redaction tests must hardcode fake credentials.
@@ -60,6 +60,7 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 - No CI yet.
 - **The compression-ratio guard and the 50 000-member cap are in tension at the extreme.** An archive of 50 000 *empty* files is mostly zero padding: measured at ~25 MiB extracted from ~355 KiB compressed, a ratio of ~74 against a cap of 100. It passes today, but with under a 1.4× margin that no real repository approaches — ordinary source sits around 5:1. The 50 000-member test therefore lifts the ratio guard, so it tests the count cap alone rather than becoming a hostage to the zlib version. If a legitimate repository is ever refused as a bomb, this is the interaction to look at first; the fix is to raise `RATIO_FLOOR_BYTES` or to exclude header padding from the numerator, not to raise the ratio.
 - **`archive.py` never returns the commit SHA**, although it validates the archive root that carries it. ARCHITECTURE.md ingestion step 5 stays `Planned` for that reason. Nothing needs it until a pipeline exists, but do not read the root check as "the SHA is harvested".
+- **Member paths are never Unicode-normalized, and downstream code must not normalize them either.** `archive.py` compares the exact code points the archive carried, which is the safe direction — NFKC folds U+FF0E to `.` and U+FF0F to `/`, so normalizing would turn an inert component into `../etc/passwd`. Six tests pin it. But the guarantee stops at this module: a normalizing filesystem, a `unicodedata.normalize` before a comparison, or a database collation would reintroduce the traversal, and folding NFC/NFD would also break the `/api/source` token, whose subject is the yielded path. Compare yielded paths byte-for-byte.
 - **`secret_filter.py` and `path_safety.py` have no callers.** Both are correct and mutation-tested; neither protects anything yet, because the code that would apply them does not exist. Grepping for the module and finding it is not evidence that a `.env` is filtered — grep for the *call*.
 - **`assert_public_ip` narrows DNS rebinding, it does not close it.** The connection that follows is made by name, so a resolver that answers differently the second time is not caught. Closing it needs connect-by-IP with SNI, which v1 does not do. Recorded in `docs/SECURITY.md`.
 - **`ruff format` is not a project gate — do not run it.** `uv run ruff check .` is the gate and is clean. `ruff format --check` reports 5 of 21 files as unformatted: four pre-existing (`app/logging_setup.py`, `tests/test_config.py`, `tests/test_logging.py`, `tests/test_models.py`) and `app/security/net_guard.py`, which is unformatted for the same reason they are — the formatter wants to join wrapped constructs into lines that then exceed the configured `line-length = 100`. Running it would rewrite unrelated code to no benefit. Either adopt it repo-wide as a deliberate decision or leave it alone; do not apply it to one file.
@@ -68,6 +69,14 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 - The pydantic **mypy plugin is not enabled** (no `plugins` key in `[tool.mypy]`). Constructor type-checking still works via PEP 681 `@dataclass_transform` on pydantic's metaclass. Reviewed and judged unnecessary; do not assume the plugin is present when reading type errors.
 
 ## Recently Completed
+
+- **2026-08-29** — **Archive reader: the missing Unicode-normalization tests added** (6 cases, `tests/test_archive.py`). An audit of the archive task against its brief found every validation layer and cap implemented and tested except this one, which had no counterpart in the suite. No production code changed — the reader was already correct — but "correct by accident" and "correct on purpose" are only distinguishable once a test pins it.
+
+  The point is inverted from the other archive tests: normalization is asserted **absent**, not present. Under NFKC, U+FF0E FULLWIDTH FULL STOP folds to `.` and U+FF0F FULLWIDTH SOLIDUS folds to `/`, so normalizing would *manufacture* `../etc/passwd` out of a name that is one inert component in the bytes the archive actually carried. Both lookalikes are asserted to survive as a single component; NFC and NFD spellings of the same grapheme are asserted to round-trip as distinct code points, because a yielded path becomes a graph node ID and the subject of an `/api/source` token, and folding one spelling into the other would make the token miss the file the user clicked; and real ASCII `..` is asserted still rejected beside them. Confirmed by mutation — inserting `unicodedata.normalize("NFKC", name)` before the component check fails three of the six.
+
+  **The residual risk is downstream, and it is worth carrying forward:** the guarantee is that *this module* compares exact code points. Anything later that normalizes a path — a normalizing filesystem, a `unicodedata.normalize` before a comparison, a database collation — undoes it. Recorded as its own row in `docs/SECURITY.md`.
+
+  Two smaller things: the fullwidth characters are written as `\uff0e`/`\uff0f` escapes rather than literals, because they are visually identical to `.` and `/` — which is the entire premise of the attack and makes them unreadable in a diff — and this also satisfies ruff's `RUF001` honestly rather than with a `noqa`.
 
 - **2026-08-29** — **Secret filter and path-safety guard implemented**: `app/security/secret_filter.py`, `app/security/path_safety.py`, plus 142 tests. `docs/SECURITY.md`'s "Future disk I/O reintroducing traversal" row moved to `Implemented`; the "Returning `.env`, keys, credentials" row moved to **`Partial`, not `Implemented`** — see below.
 
@@ -82,7 +91,7 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
   - `path_safety` raises a plain `ValueError` rather than an `AppError`: it is a low-level utility, not an HTTP boundary, and its caller owns the mapping. Its three messages are fixed literals — the NUL check exists partly so `os.stat`'s own `ValueError`, which quotes the path, never surfaces.
   - **The 12 controls in `secret_filter.py` and the 6 in `path_safety.py` were mutation-tested one deletion at a time; all 18 are caught**, including two *widening* mutations (directory rules applied to every component, and `commonpath` swapped for `startswith`). No survivors, so nothing needed a redundancy annotation.
 
-- **2026-08-29** — **Streaming archive reader implemented**: `app/fetch/archive.py`, `app/analysis/deadline.py`, `tests/fixtures/tarballs.py`, plus 136 tests. `docs/SECURITY.md`'s "Path traversal and archive attacks" table moved to five `Implemented` rows, and four resource-exhaustion rows moved to `Implemented` or `Partial`.
+- **2026-08-29** — **Streaming archive reader implemented**: `app/fetch/archive.py`, `app/analysis/deadline.py`, `tests/fixtures/tarballs.py`, plus 142 tests. `docs/SECURITY.md`'s "Path traversal and archive attacks" table moved to five `Implemented` rows, and four resource-exhaustion rows moved to `Implemented` or `Partial`.
 
   Decisions and non-obvious behaviours worth carrying forward:
   - **The gzip layer is ours, not `tarfile`'s** — `mode="r|"` over an explicit `gzip.GzipFile` rather than `r|gz`. This is the single most important design point in the module. `r|gz` leaves no seam between decompression and tar parsing, and metering has to happen at that seam: a non-seeking `tarfile` reads *past* the body of every member, including ones the reader skips for being oversized. A bomb whose payload is one 1 GiB member therefore yields **no files at all**, and any accounting that sums the sizes of accepted members sees zero bytes while a gigabyte goes through the decompressor. Metering the decompressed stream on every read kills it at ~8 MiB.
