@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+dist/
+build/
+
+# Environment — never commit real secrets; the example template is tracked
+.env
+.env.*
+!.env.example
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+coverage/
+*.lcov
+
+# OS
+.DS_Store

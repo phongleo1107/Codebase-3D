@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codebase-3d-backend"
+version = "0.1.0"
+description = "Codebase 3D backend — analyzes a public GitHub TS/JS repository into a dependency graph"
+requires-python = ">=3.14,<3.15"
+license = "MIT"
+
+dependencies = [
+    "fastapi==0.141.1",
+    "uvicorn[standard]==0.52.4",
+    "pydantic==2.13.5",
+    "pydantic-settings==2.15.0",
+    "httpx==0.28.1",
+    "tree-sitter==0.26.0",
+    "tree-sitter-typescript==0.23.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "respx==0.23.1",
+    "ruff==0.16.5",
+    "mypy==2.3.1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "--strict-markers --strict-config"
+filterwarnings = ["error"]
+
+[tool.ruff]
+# target-version is inferred from project.requires-python.
+line-length = 100
+src = ["app", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "UP",     # pyupgrade
+    "B",      # flake8-bugbear
+    "S",      # flake8-bandit
+    "ASYNC",  # flake8-async
+    "C4",     # flake8-comprehensions
+    "SIM",    # flake8-simplify
+    "PTH",    # flake8-use-pathlib
+    "RUF",    # ruff-specific
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Assertions are the point of a test file.
+"tests/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.14"
+files = ["app", "tests"]
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+disallow_any_generics = true
+no_implicit_reexport = true
