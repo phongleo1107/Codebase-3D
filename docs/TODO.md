@@ -18,14 +18,16 @@ Priority order: security → correctness → core functionality → performance 
 
 - [x] Verify the tree-sitter spike — ABI load (**ABI 14**), `QueryCursor` API (**present**), and `progress_callback` (**unusable — ignored for a bytes source, segfaults for a callback source; ADR-010**)
 
-- [x] `app/analysis/parser.py` — import extraction, incl. the negative cases a regex gets wrong — 75 tests, 26 controls mutation-tested. **No caller yet**
+- [x] `app/analysis/parser.py` — import extraction, incl. the negative cases a regex gets wrong — 75 tests, 26 controls mutation-tested
+
+- [x] `app/analysis/pipeline.py` — **the join**: one `Deadline` per request threaded into both consumers, `download_request()` actually sent with `stream=True`, `response.iter_raw()` into `iter_source_files`, commit SHA out of the archive root (ADR-011), `is_secret_path` on every path, grammar by extension, `MAX_SOURCE_FILES` as the parse cap, skips counted. 60 tests plus 9 for the new `ArchiveInfo` channel; 33 controls mutation-tested, 32 caught, the survivor annotated. Output contract is ADR-012
 
 ## Next
 
-- [ ] Apply `is_secret_path` in the analysis pipeline **and** independently in `/api/source`. Until both call it, the SECURITY.md row stays `Partial` and no `.env` is actually filtered
-- [ ] `app/analysis/resolver.py` + `jsonc.py` — extensions, index files, `.js`→`.ts`, tsconfig `paths`, workspaces
-- [ ] `app/analysis/graph_builder.py` + `pipeline.py` — `Deadline` exists (`app/analysis/deadline.py`); the pipeline that constructs one per request does not
-- [ ] `app/api/` — routes, body-size middleware, rate limiter, concurrency gate, error handlers. Map `RequestValidationError` to a bare `INVALID_REQUEST`: pydantic's `detail` embeds the offending input
+- [ ] **The second `is_secret_path` call site, in `/api/source`.** The pipeline applies it during analysis; the SECURITY.md row describes it applied *independently* in both places and stays `Partial` until the endpoint exists. A `.env` is filtered out of the graph today, but nothing yet stops a future source endpoint from serving one
+- [ ] `app/analysis/resolver.py` + `jsonc.py` — extensions, index files, `.js`→`.ts`, tsconfig `paths`, workspaces. **Includes harvesting the config files themselves**: the pipeline collects only source files, so `tsconfig.json` and workspace manifests are not yet read (`MAX_CONFIG_FILES` is in `Settings` waiting)
+- [ ] `app/analysis/graph_builder.py` — nodes, `parent` hierarchy, external/unresolved counts, `MAX_NODES`/`MAX_EDGES`, and the determinism the pipeline deliberately leaves to it: sorting, dedup, self-edge removal, `stats.dependencies == len(edges)`
+- [ ] `app/api/` — routes, body-size middleware, rate limiter, concurrency gate, error handlers. Map `RequestValidationError` to a bare `INVALID_REQUEST`: pydantic's `detail` embeds the offending input. Also where `analyze_repository` gets its worker thread and its `asyncio.wait_for` net
 - [ ] Decide `Retry-After` on 429. `AppError.__init__` takes no arguments by design (nothing dynamic can reach a body), so the header must be set by the rate limiter at the response layer, not carried on the exception
 - [ ] `POST /api/source` + HMAC tokens
 - [ ] Scaffold `frontend/` (Vite 8, React 19.2, Tailwind v4 via `@tailwindcss/vite`, TypeScript **5.9.3**)
@@ -40,6 +42,8 @@ Priority order: security → correctness → core functionality → performance 
 ## Later
 
 - [ ] End-to-end pass over the PRD §15 matrix (small JS, medium TS, monorepo, circular imports, malicious URLs, oversized repo, XSS payload in source)
+- [ ] **Run the pipeline against a real GitHub repository.** Everything is respx and in-process tarballs today; real codeload responses, redirect shapes, chunk sizes, and timing are unverified
+- [ ] Decide whether `extract_imports` should report skips, so parser-level drops can be counted in stats (today an unparseable file is a node with zero imports)
 - [ ] Confirm bounded RSS under `docker stats` during a large analysis
 - [ ] Confirm no repository content appears in container logs
 - [ ] Remove CSP `style-src 'unsafe-inline'` via `sheet.insertRule()` color-class mapping

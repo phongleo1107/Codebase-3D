@@ -1,11 +1,16 @@
 """Streaming tarball reader — the only place archive members are inspected.
 
-Consumes the byte iterator of a codeload download (``response.iter_bytes()``)
-and yields ``(path, content)`` for the regular files inside it. **Nothing is
+Consumes the byte iterator of a codeload download (``response.iter_raw()`` —
+the wire bytes, see `app/analysis/pipeline.py` on why not ``iter_bytes()``) and
+yields ``(path, content)`` for the regular files inside it. **Nothing is
 written to disk** (ADR-003): there is no temporary directory, no extraction
 step, and therefore no write syscall for a traversal or symlink escape to
 exploit. Peak memory is one member plus the fixed stream buffers, not the size
 of the repository.
+
+Facts about the archive as a whole — the commit SHA carried by the root
+directory, and the per-reason skip counts — travel on an optional
+:class:`ArchiveInfo` out-parameter rather than in the yielded tuple (ADR-011).
 
 Member paths are nevertheless validated in full, because they do not stay
 inside this module: they become graph node IDs, they are echoed back to the
@@ -55,8 +60,8 @@ import re
 import tarfile
 import zlib
 from collections import Counter
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import Generator, Iterator
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import IO, Final, NoReturn, cast
 
@@ -68,10 +73,20 @@ logger = logging.getLogger(__name__)
 
 # The single root directory GitHub's legacy tarball wraps everything in:
 # "<owner>-<repo>-<sha>" or "<repo>-<sha>". The trailing group is what makes
-# this a useful check rather than a formality — the commit SHA harvested from
-# it is authoritative and pins every later /api/source fetch
+# this a useful check rather than a formality — the commit SHA captured from it
+# is authoritative and pins every later /api/source fetch
 # (docs/ARCHITECTURE.md, ingestion step 5).
-ROOT_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]+-[0-9a-f]{7,40}")
+#
+# On a root whose *name* also contains a hyphen-delimited hex run —
+# "acme-deadbee-a1b2c3d" — the group binds the trailing run, which is the
+# correct end of the string to read a SHA from. That is not a consequence of
+# the leading `+` being greedy, as it first appears: under `fullmatch` the
+# group has to consume the entire remainder, and `-` is not in `[0-9a-f]`, so
+# exactly one split can match and greedy and lazy quantifiers agree on every
+# input. Verified by mutation — making the `+` lazy changes no result. The
+# parametrized test exists because a reader will nonetheless expect ambiguity
+# here.
+ROOT_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]+-([0-9a-f]{7,40})")
 
 # "" catches "a//b" and a leading "/"; "." and ".." catch traversal in both
 # directions of normalization. Checked per component, so no amount of nesting
@@ -128,6 +143,30 @@ class Limits:
             max_path_depth=s.MAX_PATH_DEPTH,
             max_path_length=s.MAX_PATH_LENGTH,
         )
+
+
+@dataclass(slots=True)
+class ArchiveInfo:
+    """Facts about the archive *as a whole*, filled in while it is read.
+
+    The second return channel for :func:`iter_source_files`. It exists because
+    the commit SHA is one fact about the tarball, not a fact about each file:
+    putting it in the yielded tuple would repeat a constant on every member and
+    invite a caller to trust the *last* copy rather than the root-equality check
+    that already guarantees they agree.
+
+    Mutable, and deliberately not a return value. ``commit_sha`` is set as soon
+    as the first regular member establishes the root, so a caller that stops
+    early — at ``MAX_SOURCE_FILES``, say — still has it. A generator's
+    ``return`` value would be delivered only on exhaustion, which is exactly the
+    case that does not happen.
+
+    ``skipped`` counts members this module dropped, keyed by a fixed literal
+    from :func:`_skip_kind` or by the budget that dropped them. Never a path.
+    """
+
+    commit_sha: str | None = None
+    skipped: Counter[str] = field(default_factory=Counter)
 
 
 def _reject(reason: str) -> NoReturn:
@@ -297,12 +336,22 @@ def iter_source_files(
     raw: Iterator[bytes],
     limits: Limits,
     deadline: Deadline,
-) -> Iterator[tuple[PurePosixPath, bytes]]:
+    info: ArchiveInfo | None = None,
+    # Generator, not Iterator, in the annotation as well as in fact: a caller
+    # that stops early is expected to `close()` this so the tarfile and the
+    # decompressor are released deterministically rather than at collection.
+) -> Generator[tuple[PurePosixPath, bytes]]:
     """Yield ``(path, content)`` for every acceptable regular file in a tarball.
 
-    ``raw`` is the compressed download, chunk by chunk. ``path`` is relative to
-    the archive's root directory, which is stripped — callers see
-    ``src/index.ts``, not ``owner-repo-a1b2c3d/src/index.ts``.
+    ``raw`` is the compressed download, chunk by chunk — the *wire* bytes, so
+    the byte budgets below mean what they say. ``path`` is relative to the
+    archive's root directory, which is stripped — callers see ``src/index.ts``,
+    not ``owner-repo-a1b2c3d/src/index.ts``.
+
+    ``info`` is an optional out-parameter: pass an :class:`ArchiveInfo` to
+    receive the commit SHA and the skip counts, which are facts about the
+    archive rather than about any one member. It is filled in as the archive is
+    read, so it is usable even if iteration stops early.
 
     Members are yielded in archive order and the stream is read exactly once,
     so this is a true generator: abandoning it part-way abandons the download.
@@ -314,10 +363,12 @@ def iter_source_files(
     compressed = _CountingRawStream(raw, limits.max_download_bytes)
     decompressed = _DecompressedStream(compressed, limits)
 
+    if info is None:
+        info = ArchiveInfo()
     root: str | None = None
     member_count = 0
     yielded = 0
-    skipped: Counter[str] = Counter()
+    skipped = info.skipped
 
     try:
         # mode="r|" — sequential, non-seeking. The gzip layer is ours (see the
@@ -354,10 +405,16 @@ def iter_source_files(
                     # it. git archive does not produce that.
                     _reject("member outside the archive root")
 
-                if not ROOT_PATTERN.fullmatch(components[0]):
+                root_match = ROOT_PATTERN.fullmatch(components[0])
+                if root_match is None:
                     _reject("archive root name")
                 if root is None:
                     root = components[0]
+                    # The authoritative commit SHA (docs/ARCHITECTURE.md,
+                    # ingestion step 5). Recorded from the *first* accepted
+                    # member; every later member is required to carry the same
+                    # root by the branch below, so there is nothing to revise.
+                    info.commit_sha = root_match.group(1)
                 elif components[0] != root:
                     _reject("multiple archive roots")
 

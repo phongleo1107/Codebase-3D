@@ -31,7 +31,7 @@ from app.errors import (
     ErrorCode,
     RepositoryTooLargeError,
 )
-from app.fetch.archive import ROOT_PATTERN, Limits, iter_source_files
+from app.fetch.archive import ROOT_PATTERN, ArchiveInfo, Limits, iter_source_files
 from tests.fixtures.tarballs import (
     ROOT,
     TarMember,
@@ -284,6 +284,89 @@ BAD_ROOTS: list[str] = [
 def test_unrecognised_archive_root_is_rejected(root: str) -> None:
     with pytest.raises(ArchiveRejectedError):
         read(make_member_with_name(f"{root}/src/index.ts"))
+
+
+# --------------------------------------------------------------------------
+# ArchiveInfo — the second return channel (ADR-011)
+# --------------------------------------------------------------------------
+
+
+def test_info_receives_the_commit_sha() -> None:
+    """The SHA the whole /api/source contract is pinned to.
+
+    Harvested from the root directory rather than from the redirect URL, which
+    names a commit only when the ref was already a SHA.
+    """
+    info = ArchiveInfo()
+    list(iter_source_files(chunked(make_source_tar({"a.ts": b"1"})), LIMITS, FRESH, info))
+
+    assert info.commit_sha == "a1b2c3d"
+
+
+# The root is "<name>-<sha>", and a repository name may itself end in a
+# hyphenated hex run. The trailing run is the commit; the earlier one is part
+# of the name.
+SHA_ROOTS: list[tuple[str, str]] = [
+    ("acme-widgets-a1b2c3d", "a1b2c3d"),
+    ("react-a1b2c3d", "a1b2c3d"),
+    ("facebook-react-" + "0" * 40, "0" * 40),
+    # A hex run inside the *name*: the capture must bind the last one.
+    ("acme-deadbee-a1b2c3d", "a1b2c3d"),
+    ("repo-abc-defabcd", "defabcd"),
+]
+
+
+@pytest.mark.parametrize(("root", "sha"), SHA_ROOTS, ids=[r for r, _ in SHA_ROOTS])
+def test_commit_sha_is_the_trailing_hex_run(root: str, sha: str) -> None:
+    info = ArchiveInfo()
+    list(
+        iter_source_files(
+            chunked(make_source_tar({"a.ts": b"1"}, root=root)), LIMITS, FRESH, info
+        )
+    )
+
+    assert info.commit_sha == sha
+
+
+def test_commit_sha_is_available_before_the_archive_is_exhausted() -> None:
+    """The property that makes an out-parameter the right channel.
+
+    The pipeline stops at `MAX_SOURCE_FILES` without draining the generator, so
+    a channel that only delivers on exhaustion — a generator `return` value —
+    would hand back nothing in exactly the case that needs it.
+    """
+    info = ArchiveInfo()
+    members = iter_source_files(
+        chunked(make_source_tar({"a.ts": b"1", "b.ts": b"2"})), LIMITS, FRESH, info
+    )
+
+    next(members)
+    assert info.commit_sha == "a1b2c3d"
+    members.close()
+
+
+def test_info_receives_skip_counts_keyed_by_reason() -> None:
+    """Counts the reader used to compute and then only log."""
+    payload = make_tar(
+        [
+            TarMember(name=ROOT, type=tarfile.DIRTYPE, mode=0o755),
+            TarMember(name=f"{ROOT}/real.ts", data=b"1"),
+            TarMember(name=f"{ROOT}/link.ts", type=tarfile.SYMTYPE, linkname="/etc/passwd"),
+            TarMember(name=f"{ROOT}/big.ts", data=b"x" * 4096),
+        ]
+    )
+    info = ArchiveInfo()
+    limits = replace(LIMITS, max_member_bytes=1024)
+
+    paths = [str(path) for path, _ in iter_source_files(chunked(payload), limits, FRESH, info)]
+
+    assert paths == ["real.ts"]
+    assert dict(info.skipped) == {"directory": 1, "symlink": 1, "member_size": 1}
+
+
+def test_info_is_optional() -> None:
+    """Every existing caller passes three arguments; none of them break."""
+    assert read(make_source_tar({"a.ts": b"1"})) == ["a.ts"]
 
 
 def test_multiple_roots_are_rejected() -> None:
