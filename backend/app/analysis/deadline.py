@@ -3,8 +3,13 @@
 `asyncio.wait_for` cannot kill a worker thread, and the analysis is CPU-bound
 and synchronous, so a timeout has to be *checked* rather than imposed
 (docs/SECURITY.md, "Slow-loris or endless analysis"). This is the thing that
-gets checked: between archive members, between parsed files, and inside the
-tree-sitter progress callback.
+gets checked: between archive members, and either side of each parse.
+
+**It stops the next unit of work, never the current one.** There is no check
+inside tree-sitter — `progress_callback` is unusable in 0.26.0 and
+`timeout_micros` was removed (ADR-010) — so a parse or a query already under
+way runs to completion regardless. What keeps that bounded is
+`app/analysis/parser.py`'s structural limits, not this class.
 
 Time is read from `time.monotonic`, never the wall clock — a clock adjustment
 mid-analysis must not extend or truncate the budget.

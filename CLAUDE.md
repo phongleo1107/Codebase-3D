@@ -6,7 +6,7 @@
 
 **Current MVP goal:** the smallest product that feels genuinely impressive when someone pastes a repo URL and watches their codebase become a navigable 3D structure. V1 supports **TS/JS only**.
 
-> **Status: early implementation.** As of 2026-08-29 the backend has its contract layer (config, errors, models, logging), its URL/egress security boundary, the GitHub client, the streaming archive reader, and the secret/path-safety filters, with 915 tests. There is still no routing, no parsing, and no frontend — and **no code path joins the client to the reader**, so the system can resolve a download URL and can safely consume a tarball, but has never downloaded one. The secret filter and the path guard likewise have **no callers**: they are tested rules waiting for the code that will apply them. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
+> **Status: early implementation.** As of 2026-08-29 the backend has its contract layer (config, errors, models, logging), its URL/egress security boundary, the GitHub client, the streaming archive reader, the secret/path-safety filters, and the import extractor, with 996 tests. There is still no routing, no analysis pipeline, and no frontend — and **no code path joins any of these modules to any other**, so the system can resolve a download URL, safely consume a tarball, and extract imports from a file, but has never downloaded a repository or parsed one outside a test. The secret filter and the path guard likewise have **no callers**: they are tested rules waiting for the code that will apply them. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
 
 **Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Three.js + React Three Fiber + Vite (frontend); Docker Compose (deploy). No database, no auth, no persistent storage.
 
@@ -39,9 +39,9 @@ backend/             Python package — contract layer, security boundary, inges
     models/          Pydantic graph and API schemas
     security/        url_validation.py, net_guard.py, secret_filter.py, path_safety.py
     fetch/           github.py (the only module that opens a socket), archive.py
-    analysis/        deadline.py only
+    analysis/        deadline.py, parser.py
     api/             Empty package
-  tests/             915 tests; conftest.py blocks the network suite-wide
+  tests/             996 tests; conftest.py blocks the network suite-wide
     fixtures/        tarballs.py — malicious archives built in process
 .claude/             Local Claude Code permissions (not source)
 ```
@@ -56,7 +56,7 @@ backend/             Python package — contract layer, security boundary, inges
 | [SECURITY.md](docs/SECURITY.md) | Threat model and control status |
 | [TODO.md](docs/TODO.md) | Prioritized backlog |
 
-`frontend/` does not exist yet, and most modules ARCHITECTURE.md describes under `backend/app/` are still unwritten — `api/` is an empty placeholder, `analysis/` holds only the deadline, and `security/` holds four of its five planned modules (HMAC tokens are missing). Create them as work begins, and update this section when you do.
+`frontend/` does not exist yet, and most modules ARCHITECTURE.md describes under `backend/app/` are still unwritten — `api/` is an empty placeholder, `analysis/` holds the deadline and the parser but no resolver, graph builder, or pipeline, and `security/` holds four of its five planned modules (HMAC tokens are missing). Create them as work begins, and update this section when you do.
 
 ## Development Rules
 

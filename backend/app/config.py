@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     MAX_SOURCE_FILES: int = 3000
     MAX_PARSE_BYTES: int = 1024 * 1024
     MAX_CONFIG_FILES: int = 200
+    # Pathological-parse-tree guard (app/analysis/parser.py). tree-sitter's
+    # query engine is quadratic in the *width* of an ERROR node, so a file that
+    # is one enormous syntax error costs minutes even though parsing it takes
+    # milliseconds. These two bound that; see the module docstring for the
+    # measurements. Real source stays orders of magnitude below both — the
+    # widest ERROR node in a truncated file is single digits.
+    MAX_ERROR_NODE_CHILDREN: int = 1000
+    MAX_PARSE_TREE_VISITS: int = 100_000
     ANALYSIS_TIMEOUT_S: int = 60
     MAX_NODES: int = 6000
     MAX_EDGES: int = 20_000

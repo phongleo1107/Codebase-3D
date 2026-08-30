@@ -1,6 +1,6 @@
 # Architecture
 
-> **Build status: the backend contract layer, the URL/egress security boundary, the GitHub client, and the streaming archive reader are implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, `app/fetch/github.py`, `app/fetch/archive.py`, and `app/analysis/deadline.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Note that **no code path yet joins the client to the reader** — the download request is built but never sent. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
+> **Build status: the backend contract layer, the URL/egress security boundary, the GitHub client, the streaming archive reader, the secret and path-safety filters, and the import extractor are implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, `app/security/secret_filter.py`, `app/security/path_safety.py`, `app/fetch/github.py`, `app/fetch/archive.py`, `app/analysis/deadline.py`, and `app/analysis/parser.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Note that **no code path yet joins any of these modules to any other** — the download request is built but never sent, the reader has only ever consumed a test fixture, and `is_secret_path`, `safe_relative_path`, and `extract_imports` have no callers at all. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
 >
 > Legend: `Planned` · `In progress` · `Implemented`
 
@@ -58,13 +58,19 @@ tightening a limit in the environment is actually enforced at the boundary.
 
 The token is never a client-level header — see ADR-009.
 
-### Source parsing · *Planned*
+### Source parsing · *Implemented* — `app/analysis/parser.py`
 
-tree-sitter with the TypeScript and TSX grammars. The **TSX grammar is a superset that parses plain JS/JSX**, so `.tsx .js .jsx .mjs .cjs` all use it and only one grammar package is needed.
+tree-sitter with the TypeScript and TSX grammars. The **TSX grammar is a superset that parses plain JS/JSX**, so `.tsx .js .jsx .mjs .cjs` all use it; `.ts` needs the TypeScript grammar, whose `<T>expr` type assertion TSX reads as a JSX tag. `extract_imports` takes the `Language` as a parameter — choosing it by extension is the caller's job, and that caller does not exist yet.
 
-A single query captures ESM imports, side-effect imports, `import type`, `export … from`, `export * from`, `import x = require()`, dynamic `import()`, and `require()`. Predicate filtering for `require` happens in Python rather than via `#eq?`.
+A single query captures ESM imports, side-effect imports, `import type`, `export … from`, `export * from`, `import x = require()`, dynamic `import()`, and `require()`. Predicate filtering for `require` happens in Python rather than via `#eq?` — and it has to run over `QueryCursor.matches()`, because `captures()` returns the callees and the strings as two independently ordered lists with the match association discarded.
 
-Parsing never aborts the run: oversized, binary, undecodable, and malformed files are skipped with a recorded reason and counted in stats. A recoverable syntax error is not fatal — imports found before the error are still harvested.
+Extraction stops at the specifier: `extract_imports` yields `(specifier, line)` with the specifier exactly as written, 0-indexed line. Resolution is the next stage's job.
+
+Parsing never aborts the run: oversized, binary, undecodable, and malformed files are skipped with a fixed-literal reason. A recoverable syntax error is **not** fatal — imports found before the error are still harvested, which is precisely why the hang guard keys on the width of an ERROR node rather than on `has_error`. The one exception that propagates is `AnalysisTimeoutError`, which describes the run rather than the file.
+
+**There is no in-parse timeout.** `progress_callback` is unusable in tree-sitter 0.26.0 (ignored for a `bytes` source, segfault for a callback source) and `timeout_micros` was removed, so per-file cost is bounded structurally — by `MAX_PARSE_BYTES` on the way in and by a pathological-parse-tree guard that refuses the shape which makes the *query* quadratic. See ADR-010 and docs/SECURITY.md.
+
+*Skips are logged but not yet counted in stats — the counting belongs to the pipeline, which does not exist.*
 
 ### Dependency extraction / resolution · *Planned*
 

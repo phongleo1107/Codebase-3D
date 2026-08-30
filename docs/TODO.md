@@ -16,11 +16,13 @@ Priority order: security → correctness → core functionality → performance 
 
 - [x] `app/security/secret_filter.py` + `path_safety.py` + tests — two golden lists plus a 20 000-path determinism sweep; path safety tested against real symlinks under `tmp_path`. 142 tests, all 18 controls mutation-tested. **Neither module has a caller** — wiring them is part of the two tasks below
 
+- [x] Verify the tree-sitter spike — ABI load (**ABI 14**), `QueryCursor` API (**present**), and `progress_callback` (**unusable — ignored for a bytes source, segfaults for a callback source; ADR-010**)
+
+- [x] `app/analysis/parser.py` — import extraction, incl. the negative cases a regex gets wrong — 75 tests, 26 controls mutation-tested. **No caller yet**
+
 ## Next
 
 - [ ] Apply `is_secret_path` in the analysis pipeline **and** independently in `/api/source`. Until both call it, the SECURITY.md row stays `Partial` and no `.env` is actually filtered
-- [ ] Verify the tree-sitter spike — ABI load (**done: ABI 14**) and `QueryCursor` API (**done: imports**); `progress_callback` signature still unverified, confirm before writing the extractor
-- [ ] `app/analysis/parser.py` — import extraction, incl. negative cases regex would get wrong
 - [ ] `app/analysis/resolver.py` + `jsonc.py` — extensions, index files, `.js`→`.ts`, tsconfig `paths`, workspaces
 - [ ] `app/analysis/graph_builder.py` + `pipeline.py` — `Deadline` exists (`app/analysis/deadline.py`); the pipeline that constructs one per request does not
 - [ ] `app/api/` — routes, body-size middleware, rate limiter, concurrency gate, error handlers. Map `RequestValidationError` to a bare `INVALID_REQUEST`: pydantic's `detail` embeds the offending input
