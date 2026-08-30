@@ -1,6 +1,6 @@
 # Architecture
 
-> **Build status: the backend contract layer, the URL/egress security boundary, the GitHub client, the streaming archive reader, the secret and path-safety filters, and the import extractor are implemented.** As of 2026-08-29 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, `app/security/secret_filter.py`, `app/security/path_safety.py`, `app/fetch/github.py`, `app/fetch/archive.py`, `app/analysis/deadline.py`, and `app/analysis/parser.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. Note that **no code path yet joins any of these modules to any other** — the download request is built but never sent, the reader has only ever consumed a test fixture, and `is_secret_path`, `safe_relative_path`, and `extract_imports` have no callers at all. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
+> **Build status: the backend contract layer, the URL/egress security boundary, the GitHub client, the streaming archive reader, the secret and path-safety filters, the import extractor, and the analysis pipeline that joins them are implemented.** As of 2026-08-30 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, `app/security/secret_filter.py`, `app/security/path_safety.py`, `app/fetch/github.py`, `app/fetch/archive.py`, `app/analysis/deadline.py`, `app/analysis/parser.py`, and `app/analysis/pipeline.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. **`app/analysis/pipeline.py` is what turned a pile of modules into a system**: it sends the download request, streams the response into the archive reader, applies the secret filter, and parses each file, on one `Deadline` per request. `safe_relative_path` remains the only module with no caller, by design — nothing writes to disk. There is still no resolver, no graph builder, no routing, and no frontend, so nothing yet turns a specifier into an edge or an analysis into a response body. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
 >
 > Legend: `Planned` · `In progress` · `Implemented`
 
@@ -38,29 +38,45 @@ Python 3.14, FastAPI, Pydantic v2 (pure v2 only — `pydantic.v1` is incompatibl
 | `app/logging_setup.py` | JSON logs + redaction filter | Implemented |
 | `app/models/` | Pydantic request/response schemas | Implemented |
 | `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate | Planned |
-| `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | **In progress** — `url_validation.py`, `net_guard.py`, `secret_filter.py`, `path_safety.py` Implemented; HMAC tokens Planned. The first two are called by `fetch/github.py`; the second two have **no callers**, since the analysis pass, `/api/source`, and all disk I/O are unwritten |
-| `app/fetch/` | GitHub client, streaming archive reader | **Implemented** — `github.py` (preflight + validated redirect) and `archive.py` (streaming extraction + member validation). Nothing calls both yet |
-| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder | **In progress** — `deadline.py` Implemented; everything else Planned |
+| `app/security/` | URL validation, network guard, secret filter, path safety, HMAC tokens | **In progress** — `url_validation.py`, `net_guard.py`, `secret_filter.py`, `path_safety.py` Implemented; HMAC tokens Planned. The first two are called by `fetch/github.py`; `secret_filter.py` is called by `analysis/pipeline.py` and still needs its second call site in `/api/source`; `path_safety.py` has **no caller**, by design, since nothing writes to disk |
+| `app/fetch/` | GitHub client, streaming archive reader | **Implemented** — `github.py` (preflight + validated redirect) and `archive.py` (streaming extraction + member validation). Joined by `analysis/pipeline.py`, which sends the download and feeds the response to the reader |
+| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, JSONC reader, module resolver, graph builder | **In progress** — `deadline.py`, `parser.py`, and `pipeline.py` Implemented (the file filter is `security/secret_filter.py` plus the extension map in `pipeline.py`); JSONC reader, resolver, and graph builder Planned |
 
 Limits live in `Settings` and nowhere else — request models read them through
 `get_settings()` at validation time rather than restating a number, so
 tightening a limit in the environment is actually enforced at the boundary.
 
-### Repository ingestion · *Implemented, unwired*
+### Repository ingestion · *Implemented* — driven by `app/analysis/pipeline.py`
 
-1. *Implemented* — Preflight `GET /repos/{owner}/{repo}` → default branch, canonical case, size. Reject oversized repos before any archive byte moves. `404` and `403` collapse to one opaque error so a configured token cannot become a private-repo existence oracle.
+1. *Implemented* — Preflight `GET /repos/{owner}/{repo}` → default branch, canonical case, size. Reject oversized repos before any archive byte moves. `404` and `403` collapse to one opaque error so a configured token cannot become a private-repo existence oracle. The pipeline additionally refuses a repository the API reports as `private`, with the same opaque error: the collapse hides *existence*, but a configured token that can actually read a private repository would otherwise let anyone render it.
 2. *Implemented* — `GET /repos/{owner}/{repo}/tarball/{ref}` with `follow_redirects=False`.
-3. *Implemented* — Validate the single redirect (see [SECURITY.md](SECURITY.md)). The re-request is built **without credentials** by `download_request()`; sending it belongs to step 4.
+3. *Implemented* — Validate the single redirect (see [SECURITY.md](SECURITY.md)). The re-request is built **without credentials** by `download_request()` and sent by the pipeline.
 4. *Implemented* — Stream the download into `tarfile` in non-seeking mode. **Nothing is written to disk** — see ADR-003. `app/fetch/archive.iter_source_files` takes the byte iterator and yields `(PurePosixPath, bytes)` for each acceptable regular file, with the root directory stripped.
 
    The gzip step is **ours, not `tarfile`'s**: `mode="r|"` over an explicit `gzip.GzipFile`, rather than `r|gz`. That is what creates a seam to meter the decompressed side at. It matters because a non-seeking `tarfile` must read *past* the body of every member — including ones the reader skips for being oversized — so a bomb whose payload is a single 1 GiB member yields no files at all and is invisible to any accounting that sums accepted members.
-5. *Planned* — The commit SHA is harvested from the tar root directory name and pins all later source fetches. That root name is authoritative: `get_download_url` returns a SHA only when the redirect target happens to pin one, which it does not for a branch ref (`.../legacy.tar.gz/refs/heads/main`). `archive.py` validates the root against `^[A-Za-z0-9._-]+-[0-9a-f]{7,40}$` and requires it to be identical across members, but it does not yet *return* the SHA — no caller needs it until the pipeline exists.
+
+   The byte iterator is `response.iter_raw()`, **not** `response.iter_bytes()`. httpx transparently decodes a `Content-Encoding` before the caller sees anything, and every budget in `archive.py` — `MAX_DOWNLOAD_BYTES`, and the compression-ratio guard's denominator — is defined on wire bytes. `stream=True` is likewise a control: without it httpx buffers the whole body before returning, and the download cap would be enforced against bytes already in memory.
+5. *Implemented* — The commit SHA is captured from the tar root directory name and pins all later source fetches. That root name is authoritative: `get_download_url` returns a SHA only when the redirect target happens to pin one, which it does not for a branch ref (`.../legacy.tar.gz/refs/heads/main`). `archive.py` validates the root against `^[A-Za-z0-9._-]+-([0-9a-f]{7,40})$`, requires it to be identical across members, and writes the captured group to the caller's `ArchiveInfo` (ADR-011) as soon as the first accepted member establishes it — so it survives a caller that stops early at `MAX_SOURCE_FILES`.
 
 The token is never a client-level header — see ADR-009.
 
+### Analysis pipeline · *Implemented* — `app/analysis/pipeline.py`
+
+`analyze_repository(RepoRef) -> RepositoryAnalysis` is the one code path that runs a repository. It constructs **exactly one `Deadline` per request** from `ANALYSIS_TIMEOUT_S` and threads that same frozen object into `iter_source_files` and every `extract_imports` call, so no stage can extend its own budget. Between them the two consumers check it once per archive member and twice per file, which brackets every unit of work in the loop; the pipeline adds no third check.
+
+**The deadline stops the next unit of work, not the current one** (ADR-010). There is no in-parse timeout in tree-sitter 0.26.0, so a single hostile file can hold a worker for a few seconds — ~3.3 s for the worst of a 21-input sweep — after the budget has expired.
+
+Per member, in this order: `is_secret_path` (which also excludes `node_modules`, `dist`, and `build`), then the extension → grammar map, then the `MAX_SOURCE_FILES` cap. The cap is checked **after** the filters, so it bounds files that would become nodes rather than members the archive happened to contain, and it `break`s — abandoning the rest of the download — rather than continuing. It is a different limit at a different layer from `archive.py`'s 50 000-member cap: exceeding that one rejects the whole archive, exceeding this one sets `truncated`.
+
+Skips are counted here because nothing below can: `archive.py` tallies its own and only logged them, and `parser.py` logs a reason and returns nothing. The published counts are files that produced **no node** — archive-dropped members (directories excluded, since they are not files), secret-filtered paths, and unsupported extensions. A file the *parser* gave up on is still a node with zero imports, so it is not counted; that blind spot is recorded in [CURRENT_STATE.md](CURRENT_STATE.md).
+
+Output is `RepositoryAnalysis` (ADR-012): repository coordinates, commit SHA, a tuple of content-free `SourceFile` records in archive order, the skip tally, and `truncated`. No resolution, no sorting, no graph.
+
 ### Source parsing · *Implemented* — `app/analysis/parser.py`
 
-tree-sitter with the TypeScript and TSX grammars. The **TSX grammar is a superset that parses plain JS/JSX**, so `.tsx .js .jsx .mjs .cjs` all use it; `.ts` needs the TypeScript grammar, whose `<T>expr` type assertion TSX reads as a JSX tag. `extract_imports` takes the `Language` as a parameter — choosing it by extension is the caller's job, and that caller does not exist yet.
+tree-sitter with the TypeScript and TSX grammars. The **TSX grammar is a superset that parses plain JS/JSX**, so `.tsx .js .jsx .mjs .cjs` all use it; `.ts` needs the TypeScript grammar, whose `<T>expr` type assertion TSX reads as a JSX tag. `extract_imports` takes the `Language` as a parameter; choosing it by extension is `pipeline.py`'s job (`_BY_EXTENSION`).
+
+That split is not cosmetic, and the cost of getting it wrong is silent. Measured on tree-sitter-typescript 0.23.2: a `.ts` file containing `const x = <Foo>bar;` between two imports yields both imports under the TypeScript grammar and **only the first** under TSX, because the phantom JSX element swallows the rest of the file into an ERROR node. It is symmetric — a genuine `<div>` element loses the second import the same way under the TypeScript grammar. Both directions are pinned by test. `.mts` and `.cts` are deliberately outside the v1 set.
 
 A single query captures ESM imports, side-effect imports, `import type`, `export … from`, `export * from`, `import x = require()`, dynamic `import()`, and `require()`. Predicate filtering for `require` happens in Python rather than via `#eq?` — and it has to run over `QueryCursor.matches()`, because `captures()` returns the callees and the strings as two independently ordered lists with the match association discarded.
 
@@ -70,11 +86,11 @@ Parsing never aborts the run: oversized, binary, undecodable, and malformed file
 
 **There is no in-parse timeout.** `progress_callback` is unusable in tree-sitter 0.26.0 (ignored for a `bytes` source, segfault for a callback source) and `timeout_micros` was removed, so per-file cost is bounded structurally — by `MAX_PARSE_BYTES` on the way in and by a pathological-parse-tree guard that refuses the shape which makes the *query* quadratic. See ADR-010 and docs/SECURITY.md.
 
-*Skips are logged but not yet counted in stats — the counting belongs to the pipeline, which does not exist.*
+*Skips are logged, never counted here — the counting belongs to `pipeline.py`. Note the seam's limitation: a skip is reported by yielding nothing, so the pipeline cannot tell it from a file with no imports, and a parser-skipped file remains a node with zero imports.*
 
 ### Dependency extraction / resolution · *Planned*
 
-Resolution is pure set-membership against the file list observed in the archive — no filesystem access, so it can only ever produce a real file. Order: relative → tsconfig `paths` → `baseUrl` → workspace packages → external. TS ESM `.js`→`.ts` mapping is tried before literal `.js`. `tsconfig.json` is parsed as JSONC.
+Resolution is pure set-membership against `RepositoryAnalysis.files` — the files the pipeline actually parsed, not every member the archive contained (ADR-012). No filesystem access, so it can only ever produce a real file, and because the target set *is* the node set it cannot produce an edge with no node on the far end. Order: relative → tsconfig `paths` → `baseUrl` → workspace packages → external. TS ESM `.js`→`.ts` mapping is tried before literal `.js`. `tsconfig.json` is parsed as JSONC — and note the pipeline does not currently harvest config files, so collecting them is part of this step's work.
 
 **External packages are not graph nodes** (ADR-005). They are recorded as counts on the importing file node and aggregated into stats.
 
@@ -130,10 +146,10 @@ The error contract is implemented in `app/errors.py`: 14 codes, each with a fixe
 Three trust transitions, each with an explicit validation layer:
 
 1. **Client → API** — URL grammar validation (`security/url_validation.py`, *Implemented*), request body cap, rate limit, concurrency gate (*Planned*).
-2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, called on every hop by `fetch/github.py`); the size preflight (*Implemented*); download/extraction/ratio limits and per-member path rules (`fetch/archive.py`, *Implemented*); secret filter (`security/secret_filter.py`, *Implemented as a rule, not yet applied* — no analysis pass calls it).
+2. **GitHub → Analyzer** — redirect host allowlist and resolved-IP check (`security/net_guard.py`, *Implemented*, called on every hop by `fetch/github.py`); the size and visibility preflight (*Implemented*); download/extraction/ratio limits and per-member path rules (`fetch/archive.py`, *Implemented*); secret filter (`security/secret_filter.py`, *Implemented and applied* by `analysis/pipeline.py` — still owed its second, independent call site in `/api/source`).
 3. **API → Browser** — zod validation with hard caps; source rendered as text nodes, never as an HTML string (*Planned*).
 
-Every `security/` module is a pure function — none opens a socket, and `path_safety.py` is the only one that touches the filesystem (it resolves paths; it does not read or write). `app/fetch/github.py` is what turns the egress guard into a control: it is the only module that opens a socket, and it calls both guard functions before returning any URL. `secret_filter.py` and `path_safety.py` are waiting for the same treatment from the analysis pipeline and from whatever first needs disk.
+Every `security/` module is a pure function — none opens a socket, and `path_safety.py` is the only one that touches the filesystem (it resolves paths; it does not read or write). `app/fetch/github.py` is what turns the egress guard into a control: it is the only module that opens a socket, and it calls both guard functions before returning any URL. `app/analysis/pipeline.py` does the same for the secret filter, applying it to every path the archive yields. `path_safety.py` is still waiting for whatever first needs disk, and by ADR-003 nothing should.
 
 Detail and threat mapping in [SECURITY.md](SECURITY.md).
 

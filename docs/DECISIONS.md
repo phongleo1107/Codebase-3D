@@ -171,6 +171,8 @@ This is the "eliminate the vulnerability class architecturally rather than defen
 ### Status
 Accepted
 
+---
+
 ## ADR-010 — Parser cost is bounded structurally; `progress_callback` is not used
 
 ### Decision
@@ -196,6 +198,65 @@ A single file can occupy a worker for a few seconds, and the 60 s `Deadline` sto
 - **Skip any file where `has_error` is true** — one O(1) check, but it drops real imports from every file using syntax the grammar does not know, which is common enough in real repositories to matter.
 - **Skip any error tree over a node-count threshold** (`descendant_count` is O(1)) — cheaper than the walk, but it discards a large legitimate file that has one trailing syntax error, for the same reason as above.
 - **Run the parse in a subprocess with a kill timer** — genuinely preemptive, but it means a process pool, serializing file bytes across a pipe, and a new failure mode per file, to bound something already bounded at a few seconds.
+
+### Status
+Accepted
+
+---
+
+## ADR-011 — The archive's commit SHA travels on an out-parameter, not in the yielded tuple
+
+### Decision
+`app/fetch/archive.iter_source_files` keeps yielding `(PurePosixPath, bytes)`. Facts about the archive *as a whole* — the commit SHA captured from the root directory, and the per-reason skip counts — are written into an optional `ArchiveInfo` dataclass the caller passes in. The parameter defaults to `None`, so every existing three-argument call still works.
+
+### Reason
+The reader validates the root directory name (`^[A-Za-z0-9._-]+-[0-9a-f]{7,40}$`) but never returned the SHA inside it, which docs/CURRENT_STATE.md carried as a Known Issue and which blocked ingestion step 5. The pipeline needs it: it is the commit every `/api/source` fetch is pinned to, and `get_download_url` supplies one only when the ref was already a SHA — a branch ref redirects to `.../legacy.tar.gz/refs/heads/main`, which names no commit.
+
+Three channels were available.
+
+**A changed tuple** — `(path, content, sha)` — repeats a constant on every member. It invites a caller to read the *last* copy as authoritative rather than relying on the root-equality check that already guarantees they agree, and it rewrites the call shape in 145 existing tests to carry a value almost none of them use.
+
+**The generator's `return` value**, via `StopIteration.value`, is delivered only on exhaustion. The pipeline stops at `MAX_SOURCE_FILES` without draining the generator, so the channel would be empty in precisely the case that needs it. This is the option that looks cleanest and is wrong.
+
+**A mutable out-parameter** is filled in the moment the first accepted member establishes the root, so it survives an early break, and it costs one optional argument. Mutation-by-side-effect is the cost; it is paid down by the field being on a named dataclass whose docstring says when it is populated, and by a test that asserts the SHA is present after a single `next()`.
+
+Folding the skip counts into the same object was nearly free — `iter_source_files` already computed them for a log line and threw them away — and the pipeline needs them, because a symlink or an oversized member is a file that produced no graph node and nothing below the pipeline can count it.
+
+### Alternatives considered
+- A three-element yield tuple (repeats a constant; churns every existing caller and test)
+- A generator `return` value (unavailable on the early-exit path that matters)
+- Turning the reader into a class with a `commit_sha` property (a larger interface change, and either two entry points or a rewrite of every existing call)
+- Re-deriving the SHA in the pipeline (impossible — the reader strips the root before yielding, which is the whole point)
+
+### Status
+Accepted
+
+---
+
+## ADR-012 — The pipeline hands the graph builder a content-free file list
+
+### Decision
+`app/analysis/pipeline.analyze_repository` returns a `RepositoryAnalysis`: the repository coordinates, the commit SHA, a tuple of `SourceFile` (path, language, byte count, line count, and the `ImportRef`s found in it), a skip tally keyed by fixed-literal reasons, and a `truncated` flag. It carries **no file content**, no resolution, and no ordering guarantee beyond archive order.
+
+### Reason
+*No content* is ADR-003 held at one more seam. `loc` and `size_bytes` are computed while the bytes are in hand precisely so nothing downstream needs to keep them; a field carrying `bytes` would make peak memory the size of the repository again and quietly undo the property the streaming reader exists to provide. A test asserts no field of `SourceFile` is `bytes`.
+
+*No resolution* keeps the deterministic stages separable. Specifiers come out exactly as written, so the resolver can be built and tested against a fixture list rather than against a live download.
+
+*Only parsed files are in the list*, and this is the load-bearing consequence: resolution is set-membership against exactly this collection, so it can only ever produce a file that is also a node. Publishing a wider list — every member the archive contained — would let the resolver resolve an import to a path that was secret-filtered, vendored, or never parsed, and manufacture an edge with no node on the far end. The narrower list makes dangling edges unrepresentable rather than something the graph builder has to filter out.
+
+*Archive order, not sorted order.* docs/ARCHITECTURE.md assigns sorting, dedup, and the `stats.dependencies == len(edges)` invariant to the graph builder. Sorting here would put half of a determinism guarantee in one module and half in another.
+
+### Consequences
+The resolver will need `tsconfig.json` and workspace manifests, which this contract does not carry — those are config files, not source files, and harvesting them is a deliberate later addition to the same loop (`MAX_CONFIG_FILES` is already in `Settings` for it).
+
+`extract_imports` reports a skipped file by yielding nothing, so the pipeline cannot distinguish "parsed, no imports" from "not parsed". A file the parser gave up on therefore stays in the list as a node with real bytes, real lines, and zero imports — honest, since it is a real file, but it means parser-level skips are absent from `skipped`. Recorded in docs/CURRENT_STATE.md and pinned by a test so the behaviour is deliberate rather than incidental.
+
+### Alternatives considered
+- Returning `(path, content)` and letting the graph builder measure (reintroduces whole-repository memory)
+- Returning every archive member so the resolver has a wider target set (allows edges to non-nodes)
+- Returning fully-built `GraphNode` objects (couples the pipeline to the wire contract and to node-ID and `sourceToken` decisions that belong to the graph builder)
+- Sorting here (splits the determinism guarantee across two modules)
 
 ### Status
 Accepted
