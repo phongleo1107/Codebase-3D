@@ -10,7 +10,7 @@ of the repository.
 
 Facts about the archive as a whole — the commit SHA carried by the root
 directory, and the per-reason skip counts — travel on an optional
-:class:`ArchiveInfo` out-parameter rather than in the yielded tuple (ADR-011).
+:class:`ArchiveInfo` out-parameter rather than in the yielded tuple (ADR-015).
 
 Member paths are nevertheless validated in full, because they do not stay
 inside this module: they become graph node IDs, they are echoed back to the

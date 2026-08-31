@@ -156,7 +156,7 @@ class ImportRef:
 
 @dataclass(frozen=True, slots=True)
 class SourceFile:
-    """One analyzed file. Carries no content — see ADR-003 and ADR-012.
+    """One analyzed file. Carries no content — see ADR-003 and ADR-016.
 
     ``loc`` and ``size_bytes`` are computed here because this is the last place
     the bytes exist. Holding the content instead so that a later stage could
@@ -173,7 +173,7 @@ class SourceFile:
 
 @dataclass(frozen=True, slots=True)
 class RepositoryAnalysis:
-    """Everything the graph builder needs, and nothing it does not (ADR-012).
+    """Everything the graph builder needs, and nothing it does not (ADR-016).
 
     ``files`` is in archive order. Sorting, dedup, and the
     ``stats.dependencies == len(edges)`` invariant belong to the graph builder

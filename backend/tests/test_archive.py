@@ -287,7 +287,7 @@ def test_unrecognised_archive_root_is_rejected(root: str) -> None:
 
 
 # --------------------------------------------------------------------------
-# ArchiveInfo — the second return channel (ADR-011)
+# ArchiveInfo — the second return channel (ADR-015)
 # --------------------------------------------------------------------------
 
 

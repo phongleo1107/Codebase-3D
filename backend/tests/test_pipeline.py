@@ -911,7 +911,7 @@ def test_hostile_archive_still_rejects_through_the_pipeline(client: httpx.Client
 
 
 # --------------------------------------------------------------------------
-# The output contract (ADR-012)
+# The output contract (ADR-016)
 # --------------------------------------------------------------------------
 
 
