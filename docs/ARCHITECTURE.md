@@ -43,7 +43,7 @@ Python 3.14, FastAPI, Pydantic v2 (pure v2 only — `pydantic.v1` is incompatibl
 | `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate | Planned |
 | `app/security/` | URL validation, network guard, secret filter, path safety | **Implemented for MVP scope** — `url_validation.py`, `net_guard.py`, `secret_filter.py`, `path_safety.py`. The first two are called by `fetch/github.py`, `secret_filter.py` by `analysis/pipeline.py`; `path_safety.py` still has **no caller**, since all disk I/O remains unwritten. HMAC tokens are **deferred, not missing**: they belonged to `/api/source` and `/api/explain`, both now out of MVP scope (ADR-013) |
 | `app/fetch/` | GitHub client, streaming archive reader | **Implemented** — `github.py` (preflight + validated redirect) and `archive.py` (streaming extraction + member validation, and the commit SHA from the archive root). `analysis/pipeline.py` calls both |
-| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, description extractor, JSONC reader, module resolver, graph builder, route-detection query (service map), component-diagram generator | **In progress** — `deadline.py`, `parser.py`, `pipeline.py` Implemented, `resolver.py` In progress; description extractor, graph builder, route detection, diagram generator Planned. `pipeline.analyze_repository` returns a content-free `SourceFile` per file (ADR-016) plus the SHA and the skip/truncation counters, and resolves nothing; `resolver.resolve_imports` then answers each specifier against that same file list. The MVP resolver is relative-imports + bare-specifier-as-external only — no `tsconfig.paths`/workspaces (deferred, see TODO.md), with the config seam decided in ADR-017 and stubbed |
+| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, description extractor, JSONC reader, module resolver, graph builder, route-detection query (service map), component-diagram generator | **In progress** — `deadline.py`, `parser.py`, `pipeline.py`, `graph_builder.py` Implemented, `resolver.py` In progress; description extractor, route detection, diagram generator Planned. `pipeline.analyze_repository` returns a content-free `SourceFile` per file (ADR-016) plus the SHA and the skip/truncation counters, and resolves nothing; `resolver.resolve_imports` answers each specifier against that same file list; `graph_builder.build_graph` turns both into sorted, deduplicated nodes/edges/stats (ADR-018). The MVP resolver is relative-imports + bare-specifier-as-external only — no `tsconfig.paths`/workspaces (deferred, see TODO.md), with the config seam decided in ADR-017 and stubbed |
 
 There is **no `app/llm/`**, and there must not be one. ADR-013 removed the LLM layer from the project; adding it back requires superseding that ADR.
 
@@ -113,6 +113,20 @@ The set-membership rule does the work of several checks that are therefore absen
 
 **External packages are not graph nodes** (ADR-005). They are recorded as counts on the importing file node and aggregated into stats.
 
+### Graph construction · *Implemented* — `app/analysis/graph_builder.py`
+
+`build_graph(analysis, resolved) -> (nodes, edges, stats)`. The resolver's first caller, and the module that does the determinism work the pipeline and the resolver deliberately left undone (ADR-016). Pure, no I/O, no clock, no `Deadline`, and — like the resolver — **no logger**; two tests pin both structurally, one building a graph with the `os` filesystem primitives torn out and one asserting no record is emitted at any level.
+
+One node per file, plus one per directory that is an ancestor of some file, plus the repository root. Node `id` **is** the repository-relative path, so edges name nodes by a string a reader already understands; the root is `"."`, `depth` 0, `parent: None`, named for the repository (ADR-018). Directories are inferred from the parent hierarchy (ADR-006) — the archive reader yields no directory entries.
+
+One edge per `RESOLVED` import, deduplicated, with self-edges dropped: a file that imports itself is a true statement the resolver reports and not a dependency. Nodes and edges are both sorted by path **components** rather than by path string, which puts a directory immediately before its contents and the root first, so a parent always precedes its children.
+
+Counters, and the identities they have to satisfy: `node.imports` / `node.importedBy` are taken off the *finished* edge set, so `sum(imports) == sum(importedBy) == len(edges) == stats.dependencies`. `externalImports` / `unresolvedImports` are statement counts, not distinct-package counts. Directory `fileCount` / `totalBytes` are recursive, so `root.fileCount == stats.files`. `skippedFiles` and `truncated` are carried from the analysis unchanged — the builder truncates nothing of its own.
+
+Two contradictions a tarball can legally produce are resolved rather than raised: a path that is both a file and another file's ancestor stays a **file** node (observed beats inferred), and a repeated path is one node built from the first record. The two preconditions a *caller* could break — a resolved import whose source, or whose target, is not in the analysis — raise `ValueError` with a fixed literal message and no path in it.
+
+**`MAX_NODES` / `MAX_EDGES` are not enforced here**; they belong to the routing layer, which does not exist. The hand-off is not free: a cap cannot simply truncate the returned tuples, because the stats and the per-node counters are computed here and would immediately be false.
+
 ### Graph model · *Implemented* — `app/models/graph.py`, `app/models/api.py`
 
 Matches the PRD contract. `type` is `"directory" | "file"`; `relationship` is `"imports"`. Directory hierarchy travels on a **`parent` field on the node**, not on edges (ADR-006), so `stats.dependencies == len(edges)` holds exactly.
@@ -121,7 +135,7 @@ Nodes carry the metadata the frontend needs to size and color without recomputat
 
 Every model sets `extra="forbid"`. `parent` is required rather than defaulted — the analyzer must state it for every node, with `None` reserved for the root.
 
-Output is deterministic — nodes sorted by path, edges sorted by `(source, target)`, deduped, self-edges dropped. The same commit produces byte-identical JSON, which is what makes golden-file tests possible. **The models cannot enforce that**: sorting, dedup, and the `stats.dependencies == len(edges)` invariant are the graph builder's job, and it does not exist yet.
+Output is deterministic — nodes and edges sorted by path components, deduped, self-edges dropped. The same commit produces byte-identical JSON, which is what makes golden-file tests possible. **The models cannot enforce that**: sorting, dedup, and the `stats.dependencies == len(edges)` invariant are `app/analysis/graph_builder.py`'s job, and are now implemented and mutation-tested there. Note the ordering key is the `PurePosixPath.parts` tuple, not the path string — see ADR-018 for why the difference is load-bearing.
 
 **MVP addition — *the fields exist; nothing populates them*.** `AnalyzeResponse` carries two top-level fields derived from the same deterministic graph, computed after nodes and edges are final and never feeding back into them: `serviceMap` (deterministically-detected API routes, as `ServiceEndpoint` objects) and `componentDiagram` (Mermaid source). `GraphNode.description` is a third such field, carried per node.
 

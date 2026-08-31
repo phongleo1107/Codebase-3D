@@ -444,7 +444,7 @@ The cost is real and is accepted: the pipeline gains a second thing it recognize
 ### Consequences
 
 - The resolver takes a `RepositoryAnalysis` today even though it reads only `.files`. That is mild over-coupling on purpose, so the deferred work is additive.
-- `resolve_imports` is pure and total: no I/O, no clock, no `Deadline`, no exception. It needs no deadline because it does at most fifteen set lookups per import over a file list already capped at `MAX_SOURCE_FILES`.
+- `resolve_imports` is pure and total: no I/O, no clock, no `Deadline`, no exception. ~~It needs no deadline because it does at most fifteen set lookups per import over a file list already capped at `MAX_SOURCE_FILES`.~~ **Corrected 2026-08-31, by measurement.** The per-import bound is real; the conclusion drawn from it was not, because `MAX_SOURCE_FILES` caps *files* and nothing anywhere caps imports *per file* — so the total work is bounded only by `MAX_EXTRACTED_BYTES` (256 MiB), and it runs after `analyze_repository` has already spent its whole 60 s budget. Measured: 1 002 000 imports from an ~11 MiB repository resolve in **78.7 s**. Recorded as an open control in docs/SECURITY.md ("Post-parse analysis runs outside the deadline") and docs/CURRENT_STATE.md. The decision this ADR actually makes — the flat per-import output shape — is unaffected; only this consequence bullet was wrong.
 - The module has **no logger**, which is how docs/SECURITY.md's "never log import specifiers" rule is satisfied here — structurally rather than by discipline.
 - Resolution being set membership against `RepositoryAnalysis.files` means `security/path_safety.py` still has no caller and still should not: there is no base directory on disk for a resolved path to escape from.
 
@@ -455,6 +455,55 @@ The cost is real and is accepted: the pipeline gains a second thing it recognize
 - **Bare `(source, target)` tuples** — the smallest thing that draws edges, and it silently discards the two outcomes ADR-005 says to count.
 - **Config as raw bytes on `RepositoryAnalysis`** — see above; breaks a tested invariant.
 - **Config harvested by a second pass** — see above; requires a second download.
+
+### Status
+Accepted
+
+---
+
+## ADR-018 — The repository root is a node, node identity is the path, and directories are inferred
+
+### Decision
+
+`app/analysis/graph_builder.build_graph` fixes four things the wire contract left open, because the contract describes the *shape* of a `GraphNode` without saying which nodes exist.
+
+**A node's `id` is its repository-relative path**, identical to its `path`, and edges name nodes by that string. There is no second identifier space.
+
+**Directory nodes are inferred from the parent hierarchy** (ADR-006) — one per directory that is an ancestor of some analyzed file, and none for a directory that contains nothing analyzable. The archive reader yields no directory entries, so there is nothing else they could come from.
+
+**The repository root is itself a node**: `id`/`path` `"."`, `depth` 0, `parent: None`, and `name` set to the repository's name. It is the single node ADR-006 reserves `parent: None` for.
+
+**Ordering is by path components** — the `PurePosixPath.parts` tuple — for both nodes and edges, not by the path string.
+
+Two contradictions that untrusted archives can produce are resolved rather than raised. A path that is both a regular file and another file's ancestor directory (`components.ts` beside `components.ts/x.ts`, both legal in a tarball) becomes **one file node**: *observed beats inferred*. A path appearing twice in `RepositoryAnalysis.files` becomes one node whose metadata comes from the **first** record.
+
+### Reason
+
+**On identity.** The path is already unique, already validated by `fetch/archive.py`, and already what the resolver returns, so any other id would be a mapping to build, keep in sync, and debug through. It also makes an edge readable in a response body without a lookup table. The cost — ids as long as paths — is a payload-size question, and the answer to that is capping the number of nodes, not renaming them.
+
+**On the root node.** ADR-006 says `None` marks *the* root, singular, which a forest of top-level nodes does not give you. A single root also gives the frontend one entry point for a tree walk and one container for the sphere-packing layout, and makes `root.fileCount == stats.files` / `root.totalBytes` checkable identities instead of numbers only the stats carry. `PurePosixPath(".")` is not an invention: it is where `.parents` terminates for every path in the analysis, its `str()` is `"."` so it satisfies the contract's `min_length=1` without a special case, and its `parts` is `()` so it sorts first for free. Its `name` is `""`, which the contract forbids and which would be a useless label anyway — the repository's name is the only honest thing to call the repository's root.
+
+**On component ordering.** Determinism is satisfied by any total order, so this is chosen for a second property. Sorting path *strings* places `src/a.ts` after `src-b`, because `-` is 0x2d and `/` is 0x2f — a directory gets separated from its own children by an unrelated sibling. Sorting components keeps a directory immediately before its contents and puts the root first, so **a parent always precedes its children** and a consumer can build the tree in a single forward pass.
+
+**On the two contradictions.** Both inputs come from a tarball we did not write, and `ValueError` on either would let one strange archive fail an entire analysis — the wrong trade against untrusted input, and one this project has repeatedly declined to make elsewhere (a member past a budget is skipped, not fatal; an unresolvable import is counted, not thrown). *Observed beats inferred* is the tiebreaker because the file was actually in the archive and the directory was deduced; keeping the file leaves ids unique, leaves no edge dangling, leaves no count wrong, and leaves the child's `parent` naming a node that exists. It renders as a file with children, which is strange and true.
+
+### Consequences
+
+- `len(nodes) != len(analysis.files)`: nodes are files plus inferred directories plus the root. `stats.files` and `stats.directories` are counted off the **emitted nodes**, so the collision case is reported the way it was resolved.
+- `node.imports` / `node.importedBy` are counted off the **finished** edge set, after dedup and self-edge removal, so `sum(imports) == sum(importedBy) == len(edges) == stats.dependencies`. Counting `imports` from the raw import list instead would put two differently-defined numbers side by side in the inspector.
+- `externalImports` / `unresolvedImports` are **statement counts, not distinct-package counts**. Dedup is specified for edges and only for edges, and the resolver deliberately does not extract a package name from a specifier.
+- Directory `fileCount` / `totalBytes` are recursive over all descendants, which is what a containment layout sizes a shell by.
+- The builder is **uncapped**: `MAX_NODES` / `MAX_EDGES` belong to the routing layer. That is a real gap while no router exists, and it is not a free hand-off — a cap cannot simply truncate the returned tuples, because `stats.dependencies == len(edges)` and the per-node counters are computed here and would immediately be false. Whoever applies the cap must re-derive the stats or ask this module for a smaller graph.
+- Like `analysis/resolver.py`, the module is pure and has **no logger**: paths are the only repository text it handles, and docs/SECURITY.md keeps those out of records above `DEBUG`. Two tests pin this structurally — one builds a graph with the `os` filesystem primitives torn out, one asserts no log record is emitted at any level.
+- The two preconditions a caller could break — a resolved import whose `source`, or whose `target`, is not in the analysis — raise `ValueError` with a fixed literal message containing no path. A programming error, like `path_safety.safe_relative_path`'s, not an `AppError`.
+
+### Alternatives considered
+
+- **No root node; top-level entries carry `parent: None`.** A forest. Simpler by one node, but it contradicts ADR-006's singular "the root", gives the frontend no single container, and loses the `root.fileCount == stats.files` identity.
+- **Opaque or hashed node ids.** Shorter payloads and a stable id across renames, neither of which the MVP needs, in exchange for a mapping every consumer has to hold.
+- **Sorting by path string.** One character shorter as a key and splits directories from their children; see above.
+- **Raising on a file/directory collision or a repeated path.** Turns a weird-but-legal archive into a failed analysis.
+- **Preferring the inferred directory in a collision.** Requires also dropping that file's edges and correcting its counts — more code, and the resulting graph silently omits a file the repository really contains.
 
 ### Status
 Accepted

@@ -194,9 +194,26 @@ def resolve_imports(analysis: RepositoryAnalysis) -> tuple[ResolvedImport, ...]:
     which the graph builder wants for per-node external/unresolved counts
     (ADR-005) — is one `Counter` over ``.source``.
 
-    Pure and total: no I/O, no filesystem, no clock, and no exception. It needs
-    no `Deadline` because it does no unbounded work — at most fifteen set
-    lookups per import, over a file list already capped at ``MAX_SOURCE_FILES``.
+    Pure and total: no I/O, no filesystem, no clock, and no exception.
+
+    **It takes no `Deadline`, and that is currently a defect rather than a
+    property.** This docstring used to justify the omission by saying the
+    function does no unbounded work — "at most fifteen set lookups per import,
+    over a file list already capped at ``MAX_SOURCE_FILES``". The per-import
+    half is true. The other half is not: ``MAX_SOURCE_FILES`` caps *files*, and
+    nothing anywhere caps imports *per file*, so the total is bounded only by
+    ``MAX_EXTRACTED_BYTES`` (256 MiB) — and this function runs after
+    `analyze_repository` has already spent its whole 60 s budget.
+
+    Measured 2026-08-31: 3000 files by 334 unresolvable relative imports is
+    1 002 000 imports and **78.7 s** here (79 µs/import), from an ~11 MiB
+    repository. An unresolved relative specifier is the worst case by a wide
+    margin — it tries all ~15 candidates before failing, ~65x the cost of a
+    bare package specifier — and it is also the cheapest string for an attacker
+    to write. See docs/SECURITY.md, "Post-parse analysis runs outside the
+    deadline". Fixing it means either threading the `Deadline` through here or
+    capping the import count in the pipeline; both are open decisions, so
+    nothing is pretended in the meantime.
 
     The config seam (ADR-017, option 1) attaches here. When `tsconfig` ``paths``
     and workspace resolution land, the pipeline will carry an already-parsed
