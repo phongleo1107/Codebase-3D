@@ -410,3 +410,51 @@ A description extractor (ADR-013) needs the parse tree or the bytes, both of whi
 
 ### Status
 Accepted
+
+---
+
+## ADR-017 — Resolver output is a flat per-import record; config will arrive already parsed, on `RepositoryAnalysis`
+
+### Decision
+
+Two decisions about `app/analysis/resolver.py`, taken together because the second constrains the first's signature.
+
+**Output shape.** `resolve_imports(analysis) -> tuple[ResolvedImport, ...]` returns **one record per `ImportRef`**, in file order then import order. Each record carries the importing path, the specifier exactly as written, the line, a `Resolution` of `RESOLVED` / `EXTERNAL` / `UNRESOLVED`, and a target path that is set **exactly when** the resolution is `RESOLVED` — enforced in `__post_init__`, not merely documented. Nothing is sorted, deduplicated, or aggregated here.
+
+**The config seam — decided, deliberately not built.** When `tsconfig.json` `paths` / `baseUrl` and workspace packages land (Deferred, see TODO.md), configuration reaches the resolver by being **parsed inside the pipeline loop and carried on `RepositoryAnalysis` as an already-narrowed structure** — a base directory, an alias table, a workspace glob list. Not as raw bytes, and not by a second pass over the archive. `resolve_imports` already takes the whole `RepositoryAnalysis` rather than the bare file list it currently reads, so adding that field is additive rather than a signature change at every call site.
+
+### Reason
+
+**On the output shape.** The graph builder needs two different things from the same records: an edge per resolved import, and per-node `externalImports` / `unresolvedImports` counts (ADR-005). A flat sequence serves both — grouping is one `Counter` over `.source` — while a mapping keyed by source file serves only the second and has to reconstruct the first.
+
+The flat form also makes the module's exhaustiveness a *single* assertion: `len(result) == sum(len(f.imports) for f in analysis.files)`. That is the same kind of checkable identity as the pipeline's `len(files) + skipped_files`, and it was chosen for the same reason — it converts "we handled every import" from a claim into a test. A dict-of-lists loses it (a missing key and an empty list are the same reading), and a tuple of bare `(source, target)` pairs loses `line` and loses the two non-resolving outcomes entirely.
+
+Making `target` and `resolution` agree structurally rather than by convention matters because the alternative lands downstream: a record claiming both `EXTERNAL` and a target is a graph builder bug that would present as an edge to a node the user never imported. `AppError.__init__` takes no arguments for the same class of reason.
+
+**On the config seam.** Three channels were available and the deciding constraint is that two of them break something the project has already pinned.
+
+*Carrying raw config bytes on `RepositoryAnalysis`* is the cleanest-looking seam and it directly violates [ADR-016](#adr-016--the-pipeline-hands-the-graph-builder-a-content-free-file-list), which is not a preference but a tested invariant — a test asserts no field of `SourceFile` is `bytes`, and the whole point of that contract is that peak memory does not become the size of the repository. A `tsconfig.json` is small, so the memory argument is weak in this one case; the argument that is not weak is that "content-free, except for the files where it is not" is a rule nobody can apply. It is also the shape whose ambiguity the PR #2/#3 merge had just finished paying for.
+
+*A separate harvest pass in the resolver* is impossible rather than merely costly. Under [ADR-003](#adr-003--never-write-repository-data-to-disk) nothing is kept, so "re-enter the archive after ingestion" means **downloading the repository a second time** — a second network round-trip, a second decompression, and a second chance for the two passes to disagree about what the commit was.
+
+*Parsing inside the pipeline loop* is left, and it is better than a last-resort. The bytes are already in hand exactly once, in the same place `loc` and `size_bytes` are computed and for the same reason. What travels is the *parsed, narrowed* result, which is derived structure and no more file content than `loc` is — so ADR-016 holds as written and its test keeps passing. It is also the same shape [ADR-013](#adr-013--repository-authored-descriptions-replace-the-llm-narration-layer) already forced for descriptions: extract in the loop, carry the small derived value, drop the bytes.
+
+The cost is real and is accepted: the pipeline gains a second thing it recognizes by filename, and a JSONC reader lands there rather than in the resolver. That is one module knowing about two file kinds instead of two modules re-reading one archive.
+
+### Consequences
+
+- The resolver takes a `RepositoryAnalysis` today even though it reads only `.files`. That is mild over-coupling on purpose, so the deferred work is additive.
+- `resolve_imports` is pure and total: no I/O, no clock, no `Deadline`, no exception. It needs no deadline because it does at most fifteen set lookups per import over a file list already capped at `MAX_SOURCE_FILES`.
+- The module has **no logger**, which is how docs/SECURITY.md's "never log import specifiers" rule is satisfied here — structurally rather than by discipline.
+- Resolution being set membership against `RepositoryAnalysis.files` means `security/path_safety.py` still has no caller and still should not: there is no base directory on disk for a resolved path to escape from.
+
+### Alternatives considered
+
+- **A mapping keyed by source path** (`dict[PurePosixPath, tuple[ResolvedImport, ...]]`) — directly serves the per-node counts, but loses the one-record-per-import identity and makes "a file with no imports" and "a file we forgot" the same value.
+- **A result object with pre-split `edges` / `external` / `unresolved` collections** — saves the graph builder one pass, at the cost of this module deciding what an edge is. Dedup, self-edge removal, and ordering are the graph builder's by ADR-016, and splitting them across two modules is exactly what that ADR declines to do.
+- **Bare `(source, target)` tuples** — the smallest thing that draws edges, and it silently discards the two outcomes ADR-005 says to count.
+- **Config as raw bytes on `RepositoryAnalysis`** — see above; breaks a tested invariant.
+- **Config harvested by a second pass** — see above; requires a second download.
+
+### Status
+Accepted
