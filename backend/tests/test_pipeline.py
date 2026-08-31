@@ -29,6 +29,7 @@ these check that picking the wrong grammar silently loses a dependency edge.
 limits at different layers, and a test asserts they cannot be conflated.
 """
 
+import logging
 import socket
 import tarfile
 import time
@@ -1158,6 +1159,33 @@ def test_the_analysis_carries_no_file_content(client: httpx.Client) -> None:
 
 
 @respx.mock
+def test_the_only_repository_text_carried_is_a_bounded_description(
+    client: httpx.Client,
+) -> None:
+    """The companion the test above needs once `description` exists (ADR-020).
+
+    A type check cannot make ADR-016's argument on its own: the invariant is
+    "nothing on this record scales with the size of a file", and a `str` would
+    satisfy `not isinstance(..., bytes)` while holding a whole megabyte source
+    file. What actually holds the line is the cap applied at extraction, so that
+    is what is asserted — against a header comment far longer than the file it
+    would have to describe.
+    """
+    limit = SETTINGS.MAX_DESCRIPTION_CHARS
+    header = b"/** " + b"a" * (limit * 20) + b" */\n"
+    analysis = run(
+        make_source_tar({"src/a.ts": header + b"import './b';\n", "src/b.ts": b"export {};\n"}),
+        client=client,
+    )
+
+    described = next(f for f in analysis.files if str(f.path) == "src/a.ts")
+    assert described.description == "a" * limit
+    assert all(
+        len(f.description or "") <= limit for f in analysis.files
+    ), "a description is bounded by a constant, not by the size of its file"
+
+
+@respx.mock
 def test_a_file_the_parser_gives_up_on_is_still_a_node(client: httpx.Client) -> None:
     """The documented blind spot at this seam, pinned rather than hidden.
 
@@ -1177,3 +1205,132 @@ def test_a_file_the_parser_gives_up_on_is_still_a_node(client: httpx.Client) -> 
     assert blob.imports == ()
     assert blob.size_bytes == len(binary)
     assert analysis.skipped_files == 0
+
+
+# --------------------------------------------------------------------------
+# Descriptions (ADR-013, ADR-020) — the first repository text in a response
+# --------------------------------------------------------------------------
+
+DESCRIBED = {
+    "src/jsdoc.ts": b"/**\n * The user store.\n */\nexport const s = 1;\n",
+    "src/block.ts": b"/* Plain block. */\nexport const b = 2;\n",
+    "src/line.js": b"// One.\n// Two.\nconst c = 3;\n",
+    "src/bare.ts": b"export const d = 4;\n",
+}
+
+
+@respx.mock
+def test_each_comment_form_reaches_the_analysis(client: httpx.Client) -> None:
+    """The extractor's three forms, through the whole ingestion path.
+
+    `tests/test_descriptions.py` proves the forms against bytes it constructed.
+    This proves the pipeline actually calls it, on bytes that came off a
+    tarball — the same distinction `test_secret_paths_never_reach_the_parser`
+    draws between a rule existing and a rule running.
+    """
+    analysis = run(make_source_tar(DESCRIBED), client=client)
+    described = {str(f.path): f.description for f in analysis.files}
+
+    assert described == {
+        "src/jsdoc.ts": "The user store.",
+        "src/block.ts": "Plain block.",
+        "src/line.js": "One. Two.",
+        "src/bare.ts": None,
+    }
+
+
+@respx.mock
+def test_a_secret_file_never_produces_a_description(client: httpx.Client) -> None:
+    """Structurally, not by a second check (docs/SECURITY.md).
+
+    `.env.ts` is a real TypeScript file by extension and its header comment is a
+    perfectly good one. It produces no description because `is_secret_path` runs
+    first and it produces no *record at all* — which is the stronger property,
+    and the one that keeps holding if the extractor is ever moved.
+    """
+    analysis = run(
+        make_source_tar(
+            {
+                ".env.ts": b"/** Production credentials. */\nexport const KEY = 'sk-live';\n",
+                "src/ok.ts": b"/** Ordinary. */\nexport const x = 1;\n",
+            }
+        ),
+        client=client,
+    )
+
+    assert paths(analysis) == ["src/ok.ts"]
+    assert analysis.skipped[SKIP_FILTERED] == 1
+    assert all("credential" not in (f.description or "").lower() for f in analysis.files)
+
+
+@respx.mock
+def test_a_non_utf8_file_is_described_without_raising(client: httpx.Client) -> None:
+    """The parser survives undecodable bytes; the extractor must too."""
+    latin1 = "/** Café module. */\n".encode("latin-1") + b"export const x = 1;\n"
+
+    analysis = run(make_source_tar({"src/legacy.ts": latin1}), client=client)
+
+    description = analysis.files[0].description
+    assert description is not None
+    assert description.startswith("Caf") and description.endswith("module.")
+
+
+@respx.mock
+def test_control_characters_in_a_comment_never_reach_the_analysis(
+    client: httpx.Client,
+) -> None:
+    """Terminal/log injection and the XSS row's sibling, asserted end to end."""
+    hostile = b"/**\n * be\x00fore\x1b[2J after\n */\nexport const x = 1;\n"
+
+    analysis = run(make_source_tar({"src/a.ts": hostile}), client=client)
+
+    description = analysis.files[0].description
+    assert description is not None
+    assert not any(char < " " or char == "\x7f" for char in description)
+    assert "\x00" not in description
+
+
+@respx.mock
+def test_a_file_the_parser_gives_up_on_still_gets_its_description(
+    client: httpx.Client,
+) -> None:
+    """The extractor takes no tree, so a parser skip does not cost a description.
+
+    A consequence of ADR-020 worth pinning rather than discovering: this file is
+    condemned by the binary sniff and contributes no imports, but its header
+    comment is real and the node is real, so the description is too.
+    """
+    content = b"/** Generated blob. */\n" + b"\x00\x01\x02\x03" * 64
+
+    analysis = run(make_source_tar({"src/blob.ts": content}), client=client)
+
+    assert analysis.files[0].imports == ()
+    assert analysis.files[0].description == "Generated blob."
+
+
+@respx.mock
+def test_a_description_survives_the_import_cap(client: httpx.Client) -> None:
+    """The partially-read file is kept (ADR-019), and it is kept whole."""
+    settings = Settings(MAX_IMPORTS=1)
+    content = b"/** Still described. */\nimport './a';\nimport './b';\n"
+
+    analysis = run(make_source_tar({"src/a.ts": content}), client=client, settings=settings)
+
+    assert analysis.imports_truncated is True
+    assert analysis.files[0].description == "Still described."
+
+
+@respx.mock
+def test_no_description_reaches_the_logs(
+    client: httpx.Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Descriptions are repository content, so the rule that covers source code
+    and specifiers covers them (docs/SECURITY.md, "Source code in logs")."""
+    marker = "zzmarkerdescriptionzz"
+    content = f"/** {marker} */\nexport const x = 1;\n".encode()
+
+    with caplog.at_level(logging.DEBUG):
+        analysis = run(make_source_tar({"src/a.ts": content}), client=client)
+
+    assert analysis.files[0].description == marker
+    assert marker not in caplog.text

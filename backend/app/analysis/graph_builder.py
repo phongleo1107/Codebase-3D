@@ -122,11 +122,15 @@ because ``stats.dependencies == len(edges)`` and the per-node ``imports`` /
 Whoever applies the cap has to re-derive the stats, or ask this module to build
 a smaller graph. Tracked in docs/CURRENT_STATE.md.
 
-**No descriptions.** `GraphNode.description` stays `None` until
-`analysis/descriptions.py` exists and puts the file's leading header comment on
-`SourceFile` (ADR-013, ADR-016) — it cannot be recovered here, because the bytes
-it is quoted from only exist inside the pipeline loop. **No `sourceToken`**
-either: ADR-007's mechanism is deferred as one unit and the field stays `None`.
+**No description *extraction*.** `GraphNode.description` is now populated, but
+only by copying `SourceFile.description` onto the file node. The quoting, the
+stripping and the cap all happened in `analysis/descriptions.py`, called from
+the pipeline loop, because the bytes it is a quotation of exist only there
+(ADR-013, ADR-020). Nothing can be recovered or re-derived here, and directory
+nodes and the root deliberately have none: a directory has no header comment,
+and inventing one from a `README` is explicitly out of MVP scope. **No
+`sourceToken`** either: ADR-007's mechanism is deferred as one unit and the
+field stays `None`.
 
 **No layout and no positions.** Graph analysis stays independent of the
 visualization layer; placement is the frontend's, in a worker.
@@ -289,8 +293,13 @@ def _nodes(
             importedBy=inbound[path],
             externalImports=external[path],
             unresolvedImports=unresolved[path],
-            # `description` and `sourceToken` stay at their defaults: neither
-            # has a producer yet, and neither can be derived from a path.
+            # Carried through, never derived: the header comment was quoted,
+            # normalized, and bounded in the pipeline, where the bytes were
+            # (ADR-013, ADR-020). `Description` re-checks the bound at the model
+            # boundary, which is a second independent application of the rule
+            # and not the one this module relies on. `sourceToken` still stays
+            # at its default — ADR-007's mechanism is deferred as one unit.
+            description=record.description,
         )
         for path, record in files.items()
     ]

@@ -554,3 +554,67 @@ An import-cap stop is **not** a key in `RepositoryAnalysis.skipped`.
 
 ### Status
 Accepted
+
+## ADR-020 — The description is a byte-prefix scan, not a second pass over the AST
+
+### Decision
+
+`app/analysis/descriptions.py` extracts a file's leading header comment with a **lexical scan over the first `_SCAN_BYTES` (4 KiB) of the file**. It builds no tree, imports no grammar, takes no `Deadline`, and does not touch `app/analysis/parser.py`, whose "reports nothing but imports" contract is unchanged.
+
+The module splits deliberately in two:
+
+- **`header_description(source, settings)`** — the *locator* for the byte-0 case. Skips a BOM and leading whitespace, recognizes `/** … */`, `/* … */`, or an unbroken run of `//` lines, and hands the comment on.
+- **`normalize_comment(raw, settings)`** — the *normalizer*, which takes one comment's own text with its markers attached and returns the bounded description. This is the half `ServiceEndpoint.summary` will share.
+
+Normalization happens **at extraction**: markers stripped, whitespace collapsed to single spaces, non-printable characters dropped, truncated to `MAX_DESCRIPTION_CHARS` while cleaning, and empty mapped to `None`.
+
+The result rides on `SourceFile.description` (`app/analysis/pipeline.py`) and is copied onto `GraphNode.description` by the graph builder. Directory nodes and the repository root have none.
+
+### Reason
+
+**At byte 0 there is no lexical context to get wrong.** This is the whole argument, and it is narrower than "a scanner is good enough". Everything that makes JS tokenization genuinely ambiguous is a question about what *preceded* the current position — is this `/` a division or a regex delimiter, is this `//` inside a string or a template literal, is this `/*` inside a comment already. Nothing precedes the first byte of a file. A scanner anchored at position 0 is therefore not an approximation of what a parser would say there; it is the same answer, and the tree buys nothing.
+
+**The tree also is not free, and the seam it would need is worse than either.** Three options were on the table:
+
+*Widening `extract_imports`* is one parse but changes the signature and the documented contract of the module with the most tests in the project (75) and the most carefully bounded behaviour, to carry a value that has nothing to do with imports. It would also make a description depend on a *successful* parse: `parser._collect` returns early for oversized, binary, and pathologically malformed files, so exactly the files with no imports would also silently lose their header comment.
+
+*A separate `descriptions.py` that re-parses* keeps the contract and doubles the parse cost. Measured: 3000 files parse in ~5.7 s, and the worst single hostile file measures ~3.1 s — real money against a 60 s budget, spent to answer a question the parse was never needed for.
+
+*The prefix scan* costs, measured over the whole `MAX_SOURCE_FILES` cap at 3000 files:
+
+| input | per file | × 3000 |
+|---|---|---|
+| no header comment (the common case) | 0.9 µs | 0.003 s |
+| ordinary JSDoc header | 10.3 µs | 0.031 s |
+| 1 MiB file, short header | 4.0 µs | 0.012 s |
+| comment longer than the scan window | 71.4 µs | 0.214 s |
+| 4 KiB window of NUL bytes (worst measured) | 235.3 µs | **0.706 s** |
+
+So the worst adversarial case across an entire analysis is under a second, against ~5.7 s for a second parse of ordinary files — and the common case, a file with no header comment at all, is free because the first non-whitespace byte is not a `/`.
+
+**The argument is narrow on purpose, and that is why the module splits in two.** ADR-013 promises the same extractor serves `ServiceEndpoint.summary`, the comment above a route handler. That comment is *not* at byte 0, and there the argument reverses completely: locating it means knowing where the handler starts and what token precedes it, which only the tree can say. Scanning backwards from an offset over `*/` would be exactly the context-dependent guess this ADR avoids. So the shared piece is **normalizing, not locating**. Route detection will have a tree already, will take the comment as a sibling node, and will hand `node.text` to `normalize_comment` — the same input shape, markers included, that a comment node yields.
+
+**Normalizing at extraction rather than at serialization** is ADR-013's surviving security rule, and it belongs here because this is the last point where the raw comment exists. `MAX_DESCRIPTION_CHARS` on the model is a second, independent application of the bound, not the one relied on.
+
+### Consequences
+
+- **`SourceFile` now carries repository-authored text**, which it never did before, and ADR-016 still holds. That invariant is "nothing on this record scales with the size of a file": a description is bounded by a constant before it is assigned, so a 1 MiB file and a 12-byte file each contribute at most 500 characters, and the whole file list caps near 1.5 MB against the 256 MiB of extracted bytes the reader may stream. The existing `bytes`/`bytearray` test passes because a `str` is not those types — which is true but is not the argument, so `test_the_only_repository_text_carried_is_a_bounded_description` was added beside it to assert the bound itself.
+- **Non-printable characters are dropped via `str.isprintable()`**, which is False for exactly the right set: C0/C1 controls, surrogates, unassigned code points, and — the one worth naming — the `Cf` format characters, including U+202E RIGHT-TO-LEFT OVERRIDE. Those are the Trojan Source characters, and a description rendered in a browser is precisely the sink they are aimed at. Getting them for free from a rule written for ANSI escapes is luck, so it is now a test.
+- **Undecodable bytes are replaced, not refused** (`errors="replace"`), deliberately unlike `parser._specifier`'s strict decode. A specifier must match an archive path byte-for-byte, so U+FFFD there invents an edge that can never resolve; a description is displayed, never compared. There is also a case strict decoding gets actively wrong: the window is a fixed byte count and can land mid-character in a *valid* UTF-8 file, and strict would then discard that file's whole description for a reason having nothing to do with the file.
+- **A description costs nothing when the parser gives up.** A binary or oversized file yields no imports but still yields its header comment, because the extractor never needed the tree. Pinned by test.
+- **The scan window is a real bound with a real cost**: a description that begins after 4 KiB of padding is not found. Every other test in the file passes with the slice deleted, so this one is pinned explicitly.
+- **`normalize_comment` refuses input that is not comment syntax**, returning `None` rather than passing text through. It is not a general sanitizer; if route detection ever hands it the wrong node, the failure should be an absent summary and not a line of source code in a response body.
+- **23 controls were mutation-tested one at a time; all 23 are caught, with no survivors and nothing to annotate.** Three initially survived and all three were genuine test gaps rather than equivalent mutations, which is worth recording because it is the opposite of the last three modules: `normalize_comment`'s decode had no direct coverage; `* ** bold **` cannot distinguish "drop one star" from "drop the run of stars" because a space follows either way; and every `//` fixture wrote `// One.` with the conventional space, which hides a dropped line break because the space separates the words anyway. `//One.` was the input that discriminated.
+- ARCHITECTURE.md's "Description extraction" section previously said this runs "over the tree `extract_imports` already built". That sentence is now wrong and has been corrected rather than left as aspiration.
+
+### Alternatives considered
+
+- **Widen `extract_imports` to return the header comment**, via a signature change or an `ArchiveInfo`-style out-parameter (ADR-015's shape, and it would have worked mechanically). Rejected: it couples a description to a successful parse, and it spends the contract of the project's most bounded module on a value that is not an import.
+- **A separate module that re-parses.** Clean separation at roughly double the parse cost, to obtain a fact the parse cannot answer better than a four-line scan.
+- **Scan backwards from an offset, so one locator serves both callers.** This is where the byte-0 argument stops holding, and it is the reason the split is between locating and normalizing rather than between "header" and "summary".
+- **Skip a leading `#!` line**, so a CLI entry point's header is found. One line, and genuinely useful in the npm ecosystem — but a shebang is not one of the three comment forms ADR-013 names, so it is recorded as a known gap in CURRENT_STATE.md with a test pinning the current behaviour, rather than widened quietly here.
+- **Special-case `/// <reference … />`**, which becomes a useless-but-accurate description on some TypeScript files. Declined: it is the file's leading comment, so it is not *wrong*, and the rule "quote the header comment" survives better without an exception list.
+- **Drop a description that is entirely U+FFFD**, which is what a comment of undecodable bytes produces. Declined as a heuristic: the file really does have a comment we cannot read, the cap already bounds it, and "absent but never wrong" does not require "absent whenever ugly".
+
+### Status
+Accepted

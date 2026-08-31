@@ -17,6 +17,7 @@ The sequence, and who owns each step::
       -> fetch.archive.iter_source_files    wire bytes -> (path, content)
       -> security.secret_filter             drop what must never be a node
       -> analysis.parser.extract_imports    (path, content) -> specifiers
+      -> analysis.descriptions              content -> the file's header comment
       -> RepositoryAnalysis                 the graph builder's input
 
 Four things about this module are load-bearing rather than incidental.
@@ -95,6 +96,7 @@ import tree_sitter_typescript as tree_sitter_typescript_grammars
 from tree_sitter import Language
 
 from app.analysis.deadline import Deadline
+from app.analysis.descriptions import header_description
 from app.analysis.parser import extract_imports
 from app.config import Settings, get_settings
 from app.errors import NoSupportedFilesError, RepositoryNotFoundError, UpstreamUnavailableError
@@ -174,6 +176,19 @@ class SourceFile:
     the bytes exist. Holding the content instead so that a later stage could
     measure it would make peak memory the size of the repository, which is the
     property the streaming reader exists to avoid.
+
+    ``description`` is the one field that is repository-authored *text* rather
+    than a number derived from it, and it is here for exactly the same reason
+    the numbers are: it is quoted from bytes that exist only inside the loop
+    below (ADR-013, ADR-020). It does not weaken ADR-016. That invariant is
+    "nothing here scales with the size of a file", and a description is bounded
+    by ``MAX_DESCRIPTION_CHARS`` — a constant — before it is ever assigned, so a
+    1 MiB file and a 12-byte file both contribute at most 500 characters. The
+    whole file list caps out around 1.5 MB of description against the 256 MiB of
+    extracted bytes the reader is allowed to stream past. The `bytes`/`bytearray`
+    test in `tests/test_pipeline.py` passes because a `str` is not those types;
+    it *should* pass, and a companion test pins the bound rather than leaving
+    the type check to carry an argument it cannot make.
     """
 
     path: PurePosixPath
@@ -181,6 +196,7 @@ class SourceFile:
     size_bytes: int
     loc: int
     imports: tuple[ImportRef, ...]
+    description: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -463,6 +479,13 @@ def _analyze(
                 size_bytes=len(content),
                 loc=_line_count(content),
                 imports=tuple(imports),
+                # Last use of `content`, and the only reason a second pass over
+                # the repository is not needed to produce descriptions: the
+                # bytes are already here (ADR-013). It is reached only *after*
+                # `is_secret_path` and the extension test above, so a `.env`
+                # cannot produce one — a property of this ordering, not of a
+                # second check (docs/SECURITY.md).
+                description=header_description(content, settings),
             )
         )
 

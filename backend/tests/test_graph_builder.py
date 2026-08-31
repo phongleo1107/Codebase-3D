@@ -36,13 +36,16 @@ import json
 import logging
 import os
 from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import PurePosixPath
 
 import pytest
+from pydantic import ValidationError
 
 from app.analysis.graph_builder import build_graph
 from app.analysis.pipeline import ImportRef, RepositoryAnalysis, SourceFile
 from app.analysis.resolver import Resolution, ResolvedImport, resolve_imports
+from app.config import Settings
 from app.models import AnalyzeResponse, Repository
 from app.models.graph import GraphEdge, GraphNode, Stats
 
@@ -64,6 +67,7 @@ def make_analysis(
     skipped: Mapping[str, int] | None = None,
     truncated: bool = False,
     duplicate: str | None = None,
+    descriptions: Mapping[str, str] | None = None,
 ) -> RepositoryAnalysis:
     """A `RepositoryAnalysis` over ``{path: [specifier, ...]}``, in that order.
 
@@ -78,6 +82,7 @@ def make_analysis(
             size_bytes=sizes.get(path, FILE_BYTES),
             loc=FILE_LOC,
             imports=tuple(ImportRef(spec, line) for line, spec in enumerate(specs)),
+            description=(descriptions or {}).get(path),
         )
         for path, specs in layout.items()
     ]
@@ -606,7 +611,9 @@ def test_the_output_composes_into_an_analyze_response() -> None:
     assert response.stats.dependencies == len(response.edges)
     # The deterministic-JSON claim, made against the real serializer.
     assert response.model_dump_json() == response.model_copy(deep=True).model_dump_json()
-    # The three ADR-013 / ADR-007 fields nothing populates yet.
+    # The ADR-013 / ADR-007 fields nothing populates yet. `description` is no
+    # longer one of them — it is absent here because this fixture's files carry
+    # no header comment, which is the ordinary case rather than a gap.
     assert response.componentDiagram is None
     assert response.serviceMap == []
     assert all(node.description is None for node in response.nodes)
@@ -625,3 +632,83 @@ def test_nothing_is_capped_here() -> None:
     assert len(edges) == 200 * 40 - 40
     assert stats.dependencies == len(edges)
     assert stats.truncated is False
+
+
+# --------------------------------------------------------------------------
+# Descriptions (ADR-013, ADR-020) — carried, never derived
+# --------------------------------------------------------------------------
+
+
+def test_a_file_nodes_description_comes_from_its_source_record() -> None:
+    analysis = make_analysis(
+        {"src/a.ts": ["./b"], "src/b.ts": []},
+        descriptions={"src/a.ts": "The entry point."},
+    )
+
+    nodes, _, _ = build_graph(analysis, resolve_imports(analysis))
+
+    assert node_at(nodes, "src/a.ts").description == "The entry point."
+    assert node_at(nodes, "src/b.ts").description is None
+
+
+def test_directory_nodes_and_the_root_never_carry_a_description() -> None:
+    """A directory has no header comment. Deriving one from a child's, or from a
+    `README`, is explicitly out of MVP scope (ADR-013)."""
+    analysis = make_analysis(
+        {"src/a.ts": [], "src/deep/b.ts": []},
+        descriptions={"src/a.ts": "A.", "src/deep/b.ts": "B."},
+    )
+
+    nodes, _, _ = build_graph(analysis, resolve_imports(analysis))
+
+    assert [n.description for n in nodes if n.type == "directory"] == [None, None, None]
+    assert node_at(nodes, ".").description is None
+
+
+def test_a_repeated_path_takes_the_first_records_description() -> None:
+    """Same rule as every other field on a duplicated path: first wins."""
+    analysis = make_analysis({"src/a.ts": []}, descriptions={"src/a.ts": "First."})
+    first = analysis.files[0]
+    doubled = RepositoryAnalysis(
+        owner=analysis.owner,
+        name=analysis.name,
+        ref=analysis.ref,
+        commit_sha=analysis.commit_sha,
+        files=(*analysis.files, replace(first, description="Second.")),
+        skipped=analysis.skipped,
+        truncated=analysis.truncated,
+        imports_truncated=analysis.imports_truncated,
+    )
+
+    nodes, _, _ = build_graph(doubled, resolve_imports(doubled))
+
+    assert node_at(nodes, "src/a.ts").description == "First."
+
+
+def test_the_model_rejects_a_description_past_the_cap() -> None:
+    """The second, independent application of the bound.
+
+    `analysis/descriptions.py` truncates at extraction and this is not a
+    substitute for that — it is the boundary check that makes a future producer
+    which forgets fail loudly instead of shipping an unbounded string. A
+    constant is not a control, so the failure is asserted rather than assumed.
+    """
+    over = "a" * (Settings().MAX_DESCRIPTION_CHARS + 1)
+    analysis = make_analysis({"src/a.ts": []}, descriptions={"src/a.ts": over})
+
+    with pytest.raises(ValidationError):
+        build_graph(analysis, resolve_imports(analysis))
+
+
+def test_a_description_does_not_disturb_deterministic_json() -> None:
+    analysis = make_analysis(
+        {"src/a.ts": ["./b"], "src/b.ts": []},
+        descriptions={"src/a.ts": "Quoted from the repository."},
+    )
+
+    first = build_graph(analysis, resolve_imports(analysis))
+    second = build_graph(analysis, resolve_imports(analysis))
+
+    assert json.dumps([n.model_dump() for n in first[0]]) == json.dumps(
+        [n.model_dump() for n in second[0]]
+    )
