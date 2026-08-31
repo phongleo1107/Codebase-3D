@@ -507,3 +507,50 @@ Two contradictions that untrusted archives can produce are resolved rather than 
 
 ### Status
 Accepted
+
+---
+
+## ADR-019 — `MAX_IMPORTS` caps resolution in the pipeline, instead of giving the resolver a `Deadline`
+
+### Decision
+
+`app/analysis/pipeline._analyze` counts every import as it comes out of `extract_imports` and stops parsing at `MAX_IMPORTS` (100 000, `app/config.py`), setting `truncated` and a new `imports_truncated` on `RepositoryAnalysis`.
+
+The count is a **running total across all files**, not a per-file limit, and it is checked **per import**, not per file — so the stop can land in the middle of a file. That file is **kept**, with the imports collected so far.
+
+`analysis/resolver.py` and `analysis/graph_builder.py` still take **no `Deadline`**. The bound on them is this count, upstream, not a clock of their own.
+
+An import-cap stop is **not** a key in `RepositoryAnalysis.skipped`.
+
+### Reason
+
+**The phase after the pipeline has no clock, and it is the expensive one.** `resolve_imports` runs once `analyze_repository` has returned, after the whole `ANALYSIS_TIMEOUT_S` budget has been spent. Its cost is linear in the import count at ~77 µs per unresolvable relative specifier — the worst case, since each tries all ~15 candidates before failing, and also the cheapest string for an attacker to write. Nothing bounded that count: `MAX_SOURCE_FILES` caps *files*, and one 1 MiB file can hold tens of thousands of imports, so the real ceiling was `MAX_EXTRACTED_BYTES` (256 MiB). Measured 2026-08-31 on 3000 files × 334 unresolvable imports: **1 002 000 imports, 76.1 s to resolve, 81.8 s total** — more than the entire analysis budget, in a phase with no clock, off a 21.7 MiB fixture. Re-measured with the cap in place: **100 000 imports, 7.7 s to resolve, 8.2 s total.**
+
+**A count, not a clock, because a `Deadline` in the resolver produces a worse output.** Threading one through was the alternative the previous docstring named. But resolution is not incremental work that can be stopped halfway and still mean something: a partial resolution yields a graph missing edges it could have drawn, with no way to distinguish "this import resolves to nothing" from "we ran out of time before checking". `AnalysisTimeoutError` instead of a graph is the other branch, and it turns a large-but-legitimate repository into a failure that depends on how loaded the host was. A count is deterministic — the same commit produces the same graph, which is the property CLAUDE.md requires of the whole `/api/analyze` response — and it fails in the direction the project already fails everywhere else: a bounded, flagged, honest partial result.
+
+**Upstream, because downstream cannot.** The cap cannot be applied in the resolver or the builder without paying for the thing it is trying to avoid: the resolver would have to resolve the imports to discard them, and the builder computes `stats.dependencies == len(edges)` and the per-node `imports`/`importedBy` counters from what it is given, so slicing its output afterwards falsifies all three (ADR-018's consequence bullet, now the second instance of the same argument). The pipeline is the last place the number can be reduced before anything depends on it.
+
+**Per import, and the partial file is kept.** A per-file check would overshoot by however many imports the last file contained — up to ~87 000 for a single `MAX_PARSE_BYTES` file of twelve-byte `import"./a"` statements, which is most of the cap again. Keeping the partially-read file is the same call ADR-018 made for the file/directory collision and the pipeline made for a file the parser gave up on: the file *is* in the repository, its bytes and line count are true, and other files may legitimately import it. Dropping it would delete a node to hide a short list that `imports_truncated` already reports.
+
+**Not a `skipped` key**, though the task that prompted this suggested it as an option. `skipped` maps a reason to *files that produced no node*; it is what `skipped_files` sums and what will feed `stats.skippedFiles`. The file that hit the cap produced a node. Folding it in would inflate a file count with something that is not a file skip — precisely the error `_NON_FILE_SKIPS` already exists to prevent for directory entries — and would break `len(files) + skipped_files` as a description of what the archive produced.
+
+### Consequences
+
+- **`truncated` no longer means `MAX_SOURCE_FILES`.** It means *a* cap stopped the run. `imports_truncated` says which, and the distinction matters to a consumer: the file cap drops whole files off the end of archive order, while the import cap can additionally leave the last file present with a partial import list. A test pins that the two flags are distinguishable.
+- **`RepositoryAnalysis` gains `import_count`**, a derived property rather than a stored field, so it cannot drift from `files`. It is by construction the length of the sequence `resolve_imports` returns.
+- Reaching the cap **breaks**, which abandons the generator and therefore the download — identical to `MAX_SOURCE_FILES`, and for the same reason. As there, no count of what was left behind can be reported without paying for the rest of the transfer.
+- **`MAX_IMPORTS` is now the number that governs post-parse cost**, and raising it spends time in a phase with no clock. 100 000 × ~77 µs ≈ 7.9 s, ~13% of `ANALYSIS_TIMEOUT_S` again; the measured 7.7 s confirms it. For scale, `sindresorhus/ky` is 186 imports over 54 files and `pmndrs/zustand` 163 over 50 — ~3.5 per file, so a repository that dense filling all of `MAX_SOURCE_FILES` lands near 10 500. The cap is ~10× that.
+- The worst case is still **not zero cost**: an analysis can now spend ~60 s parsing and then ~8 s resolving. This bounds the total, it does not make the second phase free. `MAX_CONCURRENT_ANALYSES` (3) and the unwritten rate limiter are what bound the aggregate.
+- `MAX_NODES` / `MAX_EDGES` remain enforced nowhere. This ADR closes the *import* half of "post-parse analysis runs outside the deadline"; the graph-size half is still the router's, and the builder measured linear and cheap (300 000 imports in 0.22 s), so it was never the cost problem.
+- Six mutations of the new control were tested one at a time and **all six are caught**: the check deleted, `>` for `>=`, the counter reset per file, the inner `break` without the outer one, `imports_truncated` set without `truncated`, and the partial file dropped instead of kept.
+
+### Alternatives considered
+
+- **Thread the `Deadline` through `resolve_imports` and `build_graph`.** Non-deterministic output, and a partial resolution is indistinguishable from a genuinely unresolvable import. See above.
+- **Give the resolver its own separate time budget.** Same determinism problem, plus a second clock for a step to award itself time with — the exact thing `Deadline` being frozen exists to prevent.
+- **Cap imports per file instead of in total.** 3000 files × the per-file cap is the same hole one order of magnitude along.
+- **Make the resolver faster instead of smaller.** Worth doing on its own merits — the ~15-candidate loop for a failing relative specifier is the hot path — but a constant factor does not bound an unbounded input, and the number of imports would still be limited only by `MAX_EXTRACTED_BYTES`.
+- **Reject the repository outright past the cap**, as `MAX_ARCHIVE_MEMBERS` does. That line is drawn at "a shape an honest `git archive` could not produce"; a repository with a great many imports is merely large, so it truncates, like `MAX_SOURCE_FILES`.
+
+### Status
+Accepted

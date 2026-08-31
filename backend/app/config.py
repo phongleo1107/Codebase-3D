@@ -72,6 +72,23 @@ class Settings(BaseSettings):
     MAX_ERROR_NODE_CHILDREN: int = 1000
     MAX_PARSE_TREE_VISITS: int = 100_000
     ANALYSIS_TIMEOUT_S: int = 60
+    # Total import statements carried out of the pipeline, across all files
+    # (ADR-019). This is the bound on `analysis/resolver.py`, which runs *after*
+    # ANALYSIS_TIMEOUT_S has been spent and takes no Deadline of its own, so the
+    # limit has to be a count rather than a clock.
+    #
+    # Sized from the measured worst case: an unresolvable relative specifier
+    # costs 79 us to resolve (it tries all ~15 candidates before failing, ~65x a
+    # bare package name), so 100 000 imports is ~7.9 s -- ~13% of the analysis
+    # budget again, bounded and known, against the 78.7 s the same measurement
+    # recorded for the 1 002 000 imports a 256 MiB repository can hold today.
+    #
+    # And it is far above anything real. Measured on GitHub 2026-08-31,
+    # sindresorhus/ky is 186 imports over 54 files and pmndrs/zustand 163 over
+    # 50 -- ~3.5 per file, so a repository as dense as those filling all of
+    # MAX_SOURCE_FILES lands near 10 500. This cap is ~33 per file across 3000
+    # files: ~10x the densest repository we have measured.
+    MAX_IMPORTS: int = 100_000
     MAX_NODES: int = 6000
     MAX_EDGES: int = 20_000
 

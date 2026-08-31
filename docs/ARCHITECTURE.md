@@ -66,7 +66,9 @@ single `Deadline` and threads it through every step below.
 
    The out-parameter is deliberate. The SHA is one fact about the *archive*, not about any file, so putting it on every yielded tuple would repeat a constant once per file; and a generator cannot hand a return value to an ordinary `for` loop. It is `str | None` until the first regular file has been validated — a property inherent to a streaming reader rather than introduced by this choice — and the pipeline reads it only on the path where at least one file was yielded, which is exactly when it is set.
 
-6. *Implemented* — `is_secret_path` is applied to every yielded path **before the bytes reach the parser**, then the grammar is chosen by extension, then `extract_imports` runs. `MAX_SOURCE_FILES` (3000) is counted over accepted files rather than archive members, so a repository of assets is not truncated by its assets; reaching it abandons the generator, and therefore the download. `NoSupportedFilesError` when nothing parseable survives.
+6. *Implemented* — `is_secret_path` is applied to every yielded path **before the bytes reach the parser**, then the grammar is chosen by extension, then `extract_imports` runs. `NoSupportedFilesError` when nothing parseable survives.
+
+   **Two caps stop the loop, and both set `truncated`.** `MAX_SOURCE_FILES` (3000) is counted over accepted files rather than archive members, so a repository of assets is not truncated by its assets. `MAX_IMPORTS` (100 000) is a running total of imports across all files, checked per import rather than per file — a single 1 MiB file can hold tens of thousands, so a per-file check would overshoot the cap by most of it again. It exists because resolution runs *after* this step's whole deadline is spent and takes no clock of its own, so the import count is the only thing bounding it (ADR-019). Reaching either cap abandons the generator, and therefore the download; the import cap additionally sets `imports_truncated`, because it can leave the last file present with a partial import list where the file cap only drops whole files off the end.
 
 The token is never a client-level header — see ADR-009.
 
@@ -112,6 +114,8 @@ The set-membership rule does the work of several checks that are therefore absen
 `resolve_imports` returns one record per import — importing path, specifier as written, line, `RESOLVED`/`EXTERNAL`/`UNRESOLVED`, and a target set exactly when resolved (ADR-017). It sorts, dedupes, and counts nothing; those belong to the graph builder. How `tsconfig` will reach this module is decided (ADR-017: parsed in the pipeline loop, carried already-narrowed on `RepositoryAnalysis`) and deliberately not built.
 
 **External packages are not graph nodes** (ADR-005). They are recorded as counts on the importing file node and aggregated into stats.
+
+**This module takes no `Deadline` and runs after the analysis budget is spent; what makes that safe is `MAX_IMPORTS` upstream** (ADR-019). Cost is linear in the import count at ~77 µs for the worst case — an unresolvable relative specifier, which tries all ~15 candidates before failing. The pipeline's cap is therefore the number that governs this step: 100 000 imports measures 7.7 s here, against 76.1 s for the 1 002 000 an uncapped 256 MiB repository could carry. A clock here was the alternative and was rejected — it makes output non-deterministic and a partial resolution indistinguishable from a genuinely unresolvable import.
 
 ### Graph construction · *Implemented* — `app/analysis/graph_builder.py`
 

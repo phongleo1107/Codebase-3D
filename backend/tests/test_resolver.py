@@ -65,6 +65,7 @@ def make_analysis(layout: Mapping[str, Sequence[str]]) -> RepositoryAnalysis:
         ),
         skipped={},
         truncated=False,
+        imports_truncated=False,
     )
 
 

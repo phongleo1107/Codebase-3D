@@ -814,6 +814,174 @@ def test_source_file_cap_is_not_the_archive_member_cap(client: httpx.Client) -> 
 
 
 # --------------------------------------------------------------------------
+# MAX_IMPORTS — the bound on the phase that has no clock (ADR-019)
+# --------------------------------------------------------------------------
+#
+# `resolve_imports` runs after this module has spent the whole 60 s budget and
+# takes no `Deadline`, so the only thing bounding it is how many imports leave
+# `_analyze`. `MAX_SOURCE_FILES` does not bound that — it caps files, and one
+# file can hold tens of thousands of imports. These tests exercise the cap at
+# three digits; the measurement that motivated it (1 002 000 imports, 78.7 s)
+# is a benchmark and deliberately not a test.
+
+
+def many_imports(count: int) -> bytes:
+    """One file carrying ``count`` unresolvable relative imports.
+
+    Unresolvable and relative on purpose: that is the worst case the cap is
+    sized against — each one tries every candidate extension before failing,
+    ~65x the cost of resolving a bare package name.
+    """
+    return b"".join(b"import './missing%d';\n" % i for i in range(count))
+
+
+@respx.mock
+def test_import_cap_truncates_and_says_so(client: httpx.Client) -> None:
+    analysis = run(
+        make_source_tar({"src/many.ts": many_imports(10_000)}),
+        client=client,
+        settings=Settings(MAX_IMPORTS=500),
+    )
+
+    assert analysis.import_count == 500
+    assert analysis.truncated is True
+    assert analysis.imports_truncated is True
+
+
+@respx.mock
+def test_both_flags_are_false_when_every_import_fits(client: httpx.Client) -> None:
+    analysis = run(
+        make_source_tar({"src/many.ts": many_imports(50)}),
+        client=client,
+        settings=Settings(MAX_IMPORTS=500),
+    )
+
+    assert analysis.import_count == 50
+    assert analysis.truncated is False
+    assert analysis.imports_truncated is False
+
+
+@respx.mock
+def test_import_cap_stops_mid_file_and_keeps_the_partial_file(client: httpx.Client) -> None:
+    """A single file can exceed the cap by itself, so the stop lands inside one.
+
+    The file stays in the analysis with the imports collected so far. Dropping
+    it would delete a node other files may legitimately import — and its bytes
+    and line count are not made untrue by a short import list. `truncated` is
+    what says the list is short.
+    """
+    analysis = run(
+        make_source_tar({"src/many.ts": many_imports(10_000)}),
+        client=client,
+        settings=Settings(MAX_IMPORTS=7),
+    )
+
+    assert paths(analysis) == ["src/many.ts"]
+    assert len(analysis.files[0].imports) == 7
+    # The file itself is reported honestly; only the imports were cut.
+    assert analysis.files[0].loc == 10_000
+    assert analysis.imports_truncated is True
+
+
+@respx.mock
+def test_import_cap_abandons_the_rest_of_the_repository(client: httpx.Client) -> None:
+    """The whole point: reaching the cap stops parsing, it does not merely trim.
+
+    A cap that kept parsing and discarded the overflow would leave every later
+    file's parse cost on the clock for nothing. Breaking abandons the generator
+    and therefore the download, exactly as `MAX_SOURCE_FILES` does.
+    """
+    analysis = run(
+        make_source_tar(
+            {
+                "src/a.ts": many_imports(10_000),
+                "src/b.ts": b"import './a';\n",
+                "src/c.ts": b"import './a';\n",
+            }
+        ),
+        client=client,
+        settings=Settings(MAX_IMPORTS=100),
+    )
+
+    assert paths(analysis) == ["src/a.ts"]
+    assert analysis.import_count == 100
+
+
+@respx.mock
+def test_import_cap_is_a_total_across_files_not_a_per_file_limit(client: httpx.Client) -> None:
+    """Four imports each over five files is twenty imports, not four.
+
+    A per-file reading of the cap would let 3000 files carry 3000 times it,
+    which is the exact hole this closes.
+    """
+    analysis = run(
+        make_source_tar({f"src/f{i}.ts": many_imports(4) for i in range(5)}),
+        client=client,
+        settings=Settings(MAX_IMPORTS=10),
+    )
+
+    assert analysis.import_count == 10
+    assert paths(analysis) == ["src/f0.ts", "src/f1.ts", "src/f2.ts"]
+    assert analysis.imports_truncated is True
+
+
+@respx.mock
+def test_the_import_cap_is_not_recorded_as_a_file_skip(client: httpx.Client) -> None:
+    """`skipped` counts files that produced no node; the capped file produced one.
+
+    Folding an import-cap marker in there would inflate `skippedFiles` with
+    something that is not a file skip — the mistake `_NON_FILE_SKIPS` already
+    exists to prevent for directory entries.
+    """
+    analysis = run(
+        make_source_tar({"src/many.ts": many_imports(10_000), "README.md": b"# hi\n"}),
+        client=client,
+        settings=Settings(MAX_IMPORTS=5),
+    )
+
+    assert analysis.imports_truncated is True
+    assert set(analysis.skipped) <= {SKIP_FILTERED, SKIP_UNSUPPORTED}
+    assert analysis.skipped_files == analysis.skipped.get(SKIP_UNSUPPORTED, 0)
+
+
+@respx.mock
+def test_the_file_cap_and_the_import_cap_are_distinguishable(client: httpx.Client) -> None:
+    """Both set `truncated`; only one sets `imports_truncated`.
+
+    They have different consequences downstream — the file cap drops whole
+    files off the end of archive order, the import cap can also leave the last
+    file present with a partial import list — so a consumer that cannot tell
+    them apart cannot describe what it is showing.
+    """
+    tarball = make_source_tar({f"src/f{i}.ts": many_imports(3) for i in range(5)})
+
+    by_files = run(tarball, client=client, settings=Settings(MAX_SOURCE_FILES=2))
+    assert by_files.truncated is True
+    assert by_files.imports_truncated is False
+
+    respx.reset()
+    by_imports = run(tarball, client=client, settings=Settings(MAX_IMPORTS=4))
+    assert by_imports.truncated is True
+    assert by_imports.imports_truncated is True
+
+
+@respx.mock
+def test_import_count_is_what_the_resolver_will_be_handed(client: httpx.Client) -> None:
+    """`import_count` is derived, not stored, so it cannot drift from `files`.
+
+    It is also the length of the sequence `resolve_imports` returns — the
+    number the cap is actually about.
+    """
+    analysis = run(
+        make_source_tar({"src/a.ts": many_imports(6), "src/b.ts": many_imports(4)}),
+        client=client,
+    )
+
+    assert analysis.import_count == 10
+    assert analysis.import_count == sum(len(f.imports) for f in analysis.files)
+
+
+# --------------------------------------------------------------------------
 # Skip counting — the tally nothing below this module could keep
 # --------------------------------------------------------------------------
 

@@ -100,6 +100,7 @@ def make_analysis(
         files=tuple(files),
         skipped=dict(skipped or {}),
         truncated=truncated,
+        imports_truncated=False,
     )
 
 

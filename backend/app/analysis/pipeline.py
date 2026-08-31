@@ -56,6 +56,18 @@ source files*, counted after the secret filter and the extension test, and
 records ``truncated``. They are different limits at different layers and a
 repository can hit either without the other.
 
+**`MAX_IMPORTS` is here because the phase after this one has no clock**
+(ADR-019). `analysis/resolver.py` runs once this function has returned, after
+the whole ``ANALYSIS_TIMEOUT_S`` budget has been spent, and takes no `Deadline`
+— so the only thing standing between it and unbounded work is how many imports
+leave this loop. Nothing else bounds that number: ``MAX_SOURCE_FILES`` caps
+files, not imports *per* file, so before this cap the ceiling was
+``MAX_EXTRACTED_BYTES`` — measured at 1 002 000 imports costing 78.7 s to
+resolve, more than the entire analysis budget, off an ~11 MiB repository. The
+cap cannot be applied later instead: the graph builder computes
+``stats.dependencies`` and the per-node counters from what it is given, so
+truncating downstream would make those numbers lie.
+
 Skips are counted here because nothing below can count them. `parser.py` logs a
 reason and returns nothing; `archive.py` keeps a tally it used to only log. The
 counts this module publishes are the files that produced **no graph node**:
@@ -186,8 +198,18 @@ class RepositoryAnalysis:
     successfully returned analysis.
 
     ``skipped`` maps a fixed-literal reason to a count of files that produced no
-    node. ``truncated`` says ``MAX_SOURCE_FILES`` stopped the run early; it is
-    reported, never silent.
+    node. ``truncated`` says a cap stopped the run early; it is reported, never
+    silent. ``imports_truncated`` says *which* cap — ``MAX_IMPORTS`` rather than
+    ``MAX_SOURCE_FILES`` — because the two have different consequences for a
+    consumer: the file cap drops whole files off the end of archive order, while
+    the import cap can also leave the last file present with only part of its
+    import list (ADR-019).
+
+    An import-cap stop is deliberately **not** a key in ``skipped``. That map is
+    files that produced no node, it is what ``skipped_files`` sums, and the
+    file that hit the cap *is* a node — folding it in would repeat the mistake
+    ``_NON_FILE_SKIPS`` exists to prevent, and would make
+    ``len(files) + skipped_files`` stop describing what the archive produced.
     """
 
     owner: str
@@ -197,10 +219,21 @@ class RepositoryAnalysis:
     files: tuple[SourceFile, ...]
     skipped: Mapping[str, int]
     truncated: bool
+    imports_truncated: bool
 
     @property
     def skipped_files(self) -> int:
         return sum(self.skipped.values())
+
+    @property
+    def import_count(self) -> int:
+        """Imports across every analyzed file — what `MAX_IMPORTS` bounds.
+
+        Derived rather than stored, so it cannot drift from ``files``: it is
+        also, by construction, exactly the length of the sequence
+        `analysis/resolver.resolve_imports` will return.
+        """
+        return sum(len(f.imports) for f in self.files)
 
 
 @contextmanager
@@ -315,7 +348,9 @@ def analyze_repository(
             # documents that a caller stopping early should close it, so the
             # only caller in the project ought to be the reference for that.
             with closing(members):
-                files, skipped, truncated = _analyze(members, deadline, settings)
+                files, skipped, truncated, imports_truncated = _analyze(
+                    members, deadline, settings
+                )
 
     for reason, count in info.skipped.items():
         if reason not in _NON_FILE_SKIPS:
@@ -326,12 +361,13 @@ def analyze_repository(
         raise NoSupportedFilesError()
 
     logger.info(
-        "analysis complete: %d files, %d imports, %d skipped (%s), truncated=%s",
+        "analysis complete: %d files, %d imports, %d skipped (%s), truncated=%s imports=%s",
         len(files),
         sum(len(f.imports) for f in files),
         sum(skipped.values()),
         dict(sorted(skipped.items())),
         truncated,
+        imports_truncated,
     )
     return RepositoryAnalysis(
         owner=metadata.owner,
@@ -341,6 +377,7 @@ def analyze_repository(
         files=tuple(files),
         skipped=dict(skipped),
         truncated=truncated,
+        imports_truncated=imports_truncated,
     )
 
 
@@ -348,16 +385,23 @@ def _analyze(
     members: Iterator[tuple[PurePosixPath, bytes]],
     deadline: Deadline,
     settings: Settings,
-) -> tuple[list[SourceFile], Counter[str], bool]:
-    """Filter, classify, and parse each member. Returns files, skips, truncated.
+) -> tuple[list[SourceFile], Counter[str], bool, bool]:
+    """Filter, classify, and parse each member. Returns files, skips, two flags.
 
     The loop body is deliberately the only place a file is judged: the archive
     reader decides what is a *readable member*, and everything about whether it
     is a *source file we will draw* is decided here.
+
+    Two caps stop it: ``MAX_SOURCE_FILES`` on the file count and ``MAX_IMPORTS``
+    on the running import total (ADR-019). Both set ``truncated``; the second
+    additionally sets ``imports_truncated``, so a consumer can tell a short file
+    list from a short import list.
     """
     files: list[SourceFile] = []
     skipped: Counter[str] = Counter()
     truncated = False
+    imports_truncated = False
+    import_count = 0
 
     for path, content in members:
         # First, before anything looks at the extension or spends a parse on
@@ -395,21 +439,44 @@ def _analyze(
 
         language, label = grammar
         # Specifiers are not resolved, here or anywhere in this module.
-        imports = tuple(
-            ImportRef(specifier, line)
-            for specifier, line in extract_imports(content, path, language, deadline, settings)
-        )
+        #
+        # Counted one at a time rather than per file, because a single 1 MiB
+        # file can hold tens of thousands of them — `import"./a"` is twelve
+        # bytes — so a per-file check would overshoot the cap by however many
+        # the last file happened to contain. The stop can therefore land
+        # mid-file, and the partial file is kept: its bytes, lines, and the
+        # imports already collected are all true, and dropping it would delete a
+        # node that other files legitimately import. `imports_truncated` is what
+        # says the list is short.
+        imports: list[ImportRef] = []
+        for specifier, line in extract_imports(content, path, language, deadline, settings):
+            if import_count >= settings.MAX_IMPORTS:
+                truncated = imports_truncated = True
+                break
+            imports.append(ImportRef(specifier, line))
+            import_count += 1
+
         files.append(
             SourceFile(
                 path=path,
                 language=label,
                 size_bytes=len(content),
                 loc=_line_count(content),
-                imports=imports,
+                imports=tuple(imports),
             )
         )
 
-    return files, skipped, truncated
+        # Same shape as the file cap, and for the same reason: breaking
+        # abandons the generator and therefore the rest of the download. What
+        # this one buys is the phase *after* this function — `resolve_imports`
+        # runs with no Deadline at all, so its cost is whatever number leaves
+        # here, and nothing downstream can cap it without falsifying the graph
+        # stats built from it (ADR-019).
+        if imports_truncated:
+            logger.info("import cap reached: %d", settings.MAX_IMPORTS)
+            break
+
+    return files, skipped, truncated, imports_truncated
 
 
 def _line_count(content: bytes) -> int:
