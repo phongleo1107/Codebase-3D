@@ -12,6 +12,7 @@ from app.models import (
     GraphEdge,
     GraphNode,
     Repository,
+    ServiceEndpoint,
     SourceRequest,
     SourceResponse,
     Stats,
@@ -45,6 +46,12 @@ VALID_EXAMPLES: dict[type[BaseModel], dict[str, Any]] = {
         "token": "f" * 64,
     },
     SourceResponse: {"path": "src/index.ts", "content": "export {}\n"},
+    ServiceEndpoint: {
+        "method": "GET",
+        "path": "/api/users/:id",
+        "file": "src/routes/users.ts",
+        "line": 12,
+    },
 }
 
 
@@ -279,3 +286,71 @@ def test_serialization_is_deterministic_and_key_order_is_schema_order() -> None:
     assert AnalyzeResponse.model_validate(shuffled).model_dump_json() == canonical
     assert AnalyzeResponse.model_validate_json(canonical).model_dump_json() == canonical
     assert canonical.index('"repository"') < canonical.index('"nodes"') < canonical.index('"edges"')
+
+
+def test_narration_fields_default_to_absent() -> None:
+    """ADR-012: the LLM narrates over a graph that is already complete. A
+    failed or disabled narration call must degrade to a valid response
+    carrying the whole deterministic graph, never to a failed analysis."""
+    response = AnalyzeResponse.model_validate(VALID_EXAMPLES[AnalyzeResponse])
+    assert response.serviceMap == []
+    assert response.c4 is None
+
+
+def test_service_endpoint_summary_is_optional() -> None:
+    """The route is deterministic tree-sitter output; only `summary` is
+    LLM-authored, so the service map must survive the narration failing."""
+    endpoint = ServiceEndpoint.model_validate(VALID_EXAMPLES[ServiceEndpoint])
+    assert endpoint.summary is None
+    assert endpoint.method == "GET"
+
+
+def test_populated_narration_round_trips() -> None:
+    payload = {
+        **VALID_EXAMPLES[AnalyzeResponse],
+        "serviceMap": [{**VALID_EXAMPLES[ServiceEndpoint], "summary": "Fetch one user."}],
+        "c4": "C4Context\n  title Example\n",
+    }
+    response = AnalyzeResponse.model_validate(payload)
+    assert response.serviceMap[0].summary == "Fetch one user."
+    assert AnalyzeResponse.model_validate(response.model_dump()) == response
+
+
+@pytest.mark.parametrize("bad_method", ["get", "Get", "", "GET ", "G3T", "GET\n", "A" * 17])
+def test_service_endpoint_method_is_upper_case_alphabetic(bad_method: str) -> None:
+    """`GET\\n` is the case worth pinning: Python's `re` lets `$` match before a
+    trailing newline, so this asserts pydantic's regex engine is stricter."""
+    with pytest.raises(ValidationError):
+        ServiceEndpoint.model_validate({**VALID_EXAMPLES[ServiceEndpoint], "method": bad_method})
+
+
+def test_service_endpoint_line_rejects_negatives() -> None:
+    with pytest.raises(ValidationError):
+        ServiceEndpoint.model_validate({**VALID_EXAMPLES[ServiceEndpoint], "line": -1})
+
+
+@pytest.mark.parametrize("field", ["path", "file", "summary"])
+def test_service_endpoint_rejects_empty_strings(field: str) -> None:
+    with pytest.raises(ValidationError):
+        ServiceEndpoint.model_validate({**VALID_EXAMPLES[ServiceEndpoint], field: ""})
+
+
+def test_narration_bounds_track_configured_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same discipline as the URL and path bounds: config.py owns every limit,
+    so a hardcoded copy here would ignore an operator tightening it. These
+    bound what the LLM layer may put in a response body — an unbounded string
+    from a model is still an unbounded string."""
+    tightened = Settings(MAX_C4_CHARS=10, MAX_ENDPOINT_SUMMARY_CHARS=5, MAX_SERVICE_ENDPOINTS=1)
+    monkeypatch.setattr("app.models.api.get_settings", lambda: tightened)
+
+    with pytest.raises(ValidationError):
+        AnalyzeResponse.model_validate({**VALID_EXAMPLES[AnalyzeResponse], "c4": "C" * 11})
+    with pytest.raises(ValidationError):
+        ServiceEndpoint.model_validate({**VALID_EXAMPLES[ServiceEndpoint], "summary": "s" * 6})
+    with pytest.raises(ValidationError):
+        AnalyzeResponse.model_validate(
+            {
+                **VALID_EXAMPLES[AnalyzeResponse],
+                "serviceMap": [VALID_EXAMPLES[ServiceEndpoint]] * 2,
+            }
+        )

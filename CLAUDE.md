@@ -8,12 +8,14 @@
 
 > **Status: early implementation.** As of 2026-08-30 the backend has its contract layer (config, errors, models, logging), its URL/egress security boundary, the GitHub client, the streaming archive reader, the secret/path-safety filters, the import extractor, and **the analysis pipeline that joins them** (`app/analysis/pipeline.py`), with 1065 tests. A repository URL now goes in and a list of files and the module specifiers they name comes out. There is still no resolver, no graph builder, no routing, and no frontend, so nothing turns a specifier into an edge or an analysis into a response body. Two caveats worth carrying: the pipeline has only ever been driven against in-process fixtures with the HTTP transport swapped, so **nothing has been fetched from GitHub itself**; and `safe_relative_path` still has no caller, by design, while `is_secret_path` has one of the two its SECURITY.md row requires. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
 
-**Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Three.js + React Three Fiber + Vite (frontend); Docker Compose (deploy). No database, no auth, no persistent storage.
+> **2026-08-31 — scope narrowed to a 3-day MVP sprint (ADR-011, ADR-012 in [docs/DECISIONS.md](docs/DECISIONS.md)).** Three features were added beyond the original PRD — a brief C4 diagram, an API service map, and per-file explanations, all narrated by an LLM over the deterministic graph, never used to determine it — and two amendments were made for the deadline: the frontend deploys to Vercel with the backend on a separate persistent host instead of a single `docker compose up`, and the 3D layout ships sphere-packing only, with force refinement deferred. Day-by-day plan in [docs/TODO.md](docs/TODO.md).
+
+**Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Three.js + React Three Fiber + Vite + `mermaid` for C4 diagrams (frontend); an LLM API for narration only (ADR-012); Vercel (frontend) + a separate persistent host — Railway/Render/Fly (backend) for the MVP release (ADR-011), Docker Compose remaining the longer-term self-hosted target (ADR-001). No database, no auth, no persistent storage.
 
 **Architectural principles**
 
-- The analyzed repository is **untrusted data**, always.
-- Deterministic parsing only. No LLM is used to determine imports or dependencies.
+- The analyzed repository is **untrusted data**, always — including when it becomes an LLM prompt.
+- Deterministic parsing only. No LLM is used to determine imports, dependencies, or any graph structure. An LLM may only *narrate* over structure the deterministic pipeline already produced (file explanations, C4 diagrams, service-map summaries, ADR-012) — it never chooses what is fetched, parsed, filtered, or rendered, and its output is always a display-only leaf value, rendered as text or as diagram source, never as HTML.
 - Graph analysis is independent of the visualization layer; the frontend receives structured graph data, never raw parser output.
 - Validate at every boundary — HTTP request in, GitHub response in, API response into the frontend.
 - Prefer eliminating a vulnerability class architecturally over defending against it procedurally.

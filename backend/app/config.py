@@ -78,6 +78,15 @@ class Settings(BaseSettings):
     # --- Source preview ---
     MAX_PREVIEW_BYTES: int = 256 * 1024
 
+    # --- AI narration (ADR-012) ---
+    # Caps on LLM-authored output before it is allowed into a response body.
+    # The narration is display-only, so these bound payload size and rendering
+    # cost, not what a model is permitted to say. A "one-line summary" that
+    # arrives as a paragraph is a malfunction, and the boundary should say so.
+    MAX_SERVICE_ENDPOINTS: int = 200
+    MAX_ENDPOINT_SUMMARY_CHARS: int = 300
+    MAX_C4_CHARS: int = 20_000
+
     # --- Rate limiting: (max requests, window seconds) per client IP ---
     RATE_LIMIT_ANALYZE: tuple[int, int] = (5, 60)
     RATE_LIMIT_ANALYZE_HOURLY: tuple[int, int] = (60, 3600)
