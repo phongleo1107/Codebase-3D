@@ -6,7 +6,7 @@
 
 **Current MVP goal:** the smallest product that feels genuinely impressive when someone pastes a repo URL and watches their codebase become a navigable 3D structure. V1 supports **TS/JS only**.
 
-> **Status: early implementation.** As of 2026-08-30 the backend has its contract layer (config, errors, models, logging), its URL/egress security boundary, the GitHub client, the streaming archive reader, the secret/path-safety filters, the import extractor, and **the analysis pipeline that joins them** (`app/analysis/pipeline.py`), with 1065 tests. A repository URL now goes in and a list of files and the module specifiers they name comes out. There is still no resolver, no graph builder, no routing, and no frontend, so nothing turns a specifier into an edge or an analysis into a response body. Two caveats worth carrying: the pipeline has only ever been driven against in-process fixtures with the HTTP transport swapped, so **nothing has been fetched from GitHub itself**; and `safe_relative_path` still has no caller, by design, while `is_secret_path` has one of the two its SECURITY.md row requires. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
+> **Status: early implementation.** As of 2026-08-30 the backend has its contract layer (config, errors, models, logging), its URL/egress security boundary, the GitHub client, the streaming archive reader, the secret/path-safety filters, the import extractor, and **the analysis pipeline that joins them** (`app/analysis/pipeline.py`), with 1065 tests. A repository URL now goes in and a list of files and the module specifiers they name comes out. There is still no resolver, no graph builder, no routing, and no frontend, so nothing turns a specifier into an edge or an analysis into a response body. Two caveats worth carrying: the pipeline **has** now been run against real GitHub repositories (`backend/scripts/smoke.py`, 2026-08-31), but only on the happy path — no security control has ever been triggered by data we did not construct, and the pytest suite itself stays hermetic; and `safe_relative_path` still has no caller, by design, while `is_secret_path` has one of the two its SECURITY.md row requires. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
 
 **Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Three.js + React Three Fiber + Vite (frontend); Docker Compose (deploy). No database, no auth, no persistent storage.
 
@@ -41,6 +41,7 @@ backend/             Python package — contract layer, security boundary, inges
     fetch/           github.py (the only module that opens a socket), archive.py
     analysis/        deadline.py, parser.py, pipeline.py (the module that joins them)
     api/             Empty package
+  scripts/           smoke.py — real-network end-to-end check, NOT a pytest test
   tests/             1065 tests; conftest.py blocks the network suite-wide
     fixtures/        tarballs.py — malicious archives built in process
 .claude/             Local Claude Code permissions (not source)

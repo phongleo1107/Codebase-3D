@@ -67,7 +67,7 @@ select = [
 
 [tool.mypy]
 python_version = "3.14"
-files = ["app", "tests"]
+files = ["app", "scripts", "tests"]
 strict = true
 warn_unreachable = true
 warn_unused_ignores = true

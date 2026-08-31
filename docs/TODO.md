@@ -22,6 +22,8 @@ Priority order: security → correctness → core functionality → performance 
 
 - [x] `app/analysis/pipeline.py` — **the join**: one `Deadline` per request threaded into both consumers, `download_request()` actually sent with `stream=True`, `response.iter_raw()` into `iter_source_files`, commit SHA out of the archive root (ADR-011), `is_secret_path` on every path, grammar by extension, `MAX_SOURCE_FILES` as the parse cap, skips counted. 60 tests plus 9 for the new `ArchiveInfo` channel; 33 controls mutation-tested, 32 caught, the survivor annotated. Output contract is ADR-012
 
+- [x] **Run the pipeline against a real GitHub repository** — `backend/scripts/smoke.py`, deliberately outside the pytest suite so `conftest.py`'s network block stays absolute. `p-limit`, `zustand`, and `ky` analyzed clean (6/50/54 files, 1.5–2.2 s); `RepositoryNotFoundError` and `NoSupportedFilesError` confirmed against real responses. No production code changed
+
 ## Next
 
 - [ ] **The second `is_secret_path` call site, in `/api/source`.** The pipeline applies it during analysis; the SECURITY.md row describes it applied *independently* in both places and stays `Partial` until the endpoint exists. A `.env` is filtered out of the graph today, but nothing yet stops a future source endpoint from serving one
@@ -42,7 +44,7 @@ Priority order: security → correctness → core functionality → performance 
 ## Later
 
 - [ ] End-to-end pass over the PRD §15 matrix (small JS, medium TS, monorepo, circular imports, malicious URLs, oversized repo, XSS payload in source)
-- [ ] **Run the pipeline against a real GitHub repository.** Everything is respx and in-process tarballs today; real codeload responses, redirect shapes, chunk sizes, and timing are unverified
+- [ ] **Adversarial run against a *hostile* repository.** The happy path is verified (`backend/scripts/smoke.py`, three real repositories); no security control has ever been triggered by data we did not construct
 - [ ] Decide whether `extract_imports` should report skips, so parser-level drops can be counted in stats (today an unparseable file is a node with zero imports)
 - [ ] Confirm bounded RSS under `docker stats` during a large analysis
 - [ ] Confirm no repository content appears in container logs

@@ -1,6 +1,8 @@
 # Architecture Decisions
 
-All ADRs below were agreed during planning on 2026-08-29, **before any code was written**. They are accepted as the design to build toward, not as descriptions of existing code.
+**ADR-001 … ADR-008** were agreed during planning on 2026-08-29, **before any code was written**. They are accepted as the design to build toward, not as descriptions of existing code.
+
+**ADR-009 onward were written during implementation**, and each records a decision forced by something discovered while building — a library that did not behave as the plan assumed (ADR-010), a channel the plan left unspecified (ADR-011), a seam that needed defining (ADR-012), or a guarantee that a convenient test shape would have quietly weakened (ADR-013). These *do* describe existing code. Where one contradicts an earlier ADR it says so explicitly; history is never rewritten.
 
 ---
 
@@ -257,6 +259,36 @@ The resolver will need `tsconfig.json` and workspace manifests, which this contr
 - Returning every archive member so the resolver has a wider target set (allows edges to non-nodes)
 - Returning fully-built `GraphNode` objects (couples the pipeline to the wire contract and to node-ID and `sourceToken` decisions that belong to the graph builder)
 - Sorting here (splits the determinism guarantee across two modules)
+
+### Status
+Accepted
+
+---
+
+## ADR-013 — The real-network check is a script, not a pytest test
+
+### Decision
+End-to-end verification against real GitHub lives in `backend/scripts/smoke.py`, run by hand. It is not collected by pytest (`testpaths = ["tests"]`), carries no marker, and there is no supported way to make the automated suite reach the network.
+
+### Reason
+`tests/conftest.py` replaces `getaddrinfo`, `create_connection`, `gethostbyname`, and `socket.connect`/`connect_ex` for the whole session, and its docstring states the property deliberately: because the block is installed at session scope, a per-test `monkeypatch.setattr` undo restores *the block*, not the real socket module. docs/SECURITY.md turns that into a rule — "no security test may touch the network" — and calls it enforced rather than trusted.
+
+The obvious way to add a real-repository test is a `@pytest.mark.network` that lifts the block and is deselected by default. That trades a guarantee for a default. Once the hatch exists it is available to every future test, not only to this one, and the failure it guards against is silent in exactly the way that matters: a test that quietly resolves a real name passes on the author's machine, passes in CI with egress, and fails or hangs only where there is no DNS — or, worse, passes everywhere while making a real request that the suite's author never intended. The block's value is that it is unconditional.
+
+The thing being verified also does not need to be a test. It is a one-time question — *does this work against real GitHub at all* — not an invariant regressing under change. It has no assertions the fixture suite does not already make, it cannot run in CI without granting egress to a build box, and its result is a paragraph in docs/CURRENT_STATE.md rather than a red bar. A script that a human runs and reads is the honest shape for that.
+
+This is ADR-009's reasoning applied to the test suite: make the safe thing structural rather than conditional, so that a request reaches the network only if someone names a call site that does.
+
+### Consequences
+Real-network coverage is not automated and will drift — nothing fails when GitHub changes a redirect shape, and only a person running the script notices. Accepted, because the alternative regresses a security property to catch a class of change that is rare and loud when it does arrive. The script prints counts and extensions only, never a specifier, a path, or a token, because its output is the kind of thing pasted into an issue.
+
+If real-network coverage ever must be automated, the right move is a separate suite with its own conftest and its own invocation — not a marker inside the hermetic one.
+
+### Alternatives considered
+- **`@pytest.mark.network`, deselected by default** (the escape hatch this rejects; the block stops being a guarantee for every test, not just the new one)
+- **A second conftest-less test directory** (workable, and the recommended path *if* automation becomes necessary — rejected now as more machinery than a one-time check justifies)
+- **Recording real responses as fixtures with VCR-style playback** (would automate a snapshot of GitHub's behaviour, but a recording is another in-process fixture; it answers a different question than "does the live path work")
+- **Not verifying against real GitHub at all** (leaves the gap docs/CURRENT_STATE.md carried as a Known Issue — the transport, redirect shape, and chunking were entirely unexercised)
 
 ### Status
 Accepted

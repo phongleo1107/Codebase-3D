@@ -6,7 +6,7 @@ Build the MVP defined in [PRD.md](../PRD.md): paste a public GitHub URL → safe
 
 Steps 1-6 of the build order are done and green: **the backend contract** (config, errors, models, logging), **the URL/egress security boundary** (`security/url_validation.py`, `security/net_guard.py`), **the GitHub client** (`fetch/github.py`) — the first module in the project that can open a socket — **the streaming archive reader** (`fetch/archive.py`), **the import extractor** (`analysis/parser.py`), and **the analysis pipeline** (`analysis/pipeline.py`).
 
-**The modules are joined.** `analysis/pipeline.py` is the code path this project did not have until 2026-08-30: it sends the download request `github.py` builds, feeds the response stream to `archive.py`, applies `is_secret_path` to every yielded path, picks a grammar by extension, and calls `extract_imports` — all on one `Deadline`. A repository now goes in as a URL and comes out as a list of files and the specifiers they name. It has still only ever been driven against in-process fixtures with respx swapping the transport; **no byte has been fetched from GitHub itself.**
+**The modules are joined.** `analysis/pipeline.py` is the code path this project did not have until 2026-08-30: it sends the download request `github.py` builds, feeds the response stream to `archive.py`, applies `is_secret_path` to every yielded path, picks a grammar by extension, and calls `extract_imports` — all on one `Deadline`. A repository now goes in as a URL and comes out as a list of files and the specifiers they name. **As of 2026-08-31 it has been run against real GitHub repositories** — `backend/scripts/smoke.py` analyzed `sindresorhus/p-limit`, `pmndrs/zustand`, and `sindresorhus/ky` end to end, and confirmed the `RepositoryNotFoundError` and `NoSupportedFilesError` branches against real responses. The automated suite remains hermetic and fixture-driven; the smoke script is a separate entry point, never collected by pytest.
 
 **One security module is still unwired, and one is half-wired.** `safe_relative_path` has no caller, by design — nothing writes to disk (ADR-003). `is_secret_path` now has one caller, the pipeline, which is why its SECURITY.md row moved from `Partial`-with-no-call-sites to `Partial`-with-one: that row describes a filter applied during analysis **and** independently in `/api/source`, and the endpoint does not exist. A `.env` in an analyzed repository is now genuinely filtered out of the graph; nothing yet stops a future `/api/source` from serving it.
 
@@ -39,6 +39,7 @@ Steps 1-6 of the build order are done and green: **the backend contract** (confi
 | `backend/tests/fixtures/tarballs.py` | `make_tar`, `make_source_tar`, `make_member_with_name`, `make_pax_name`, `make_symlink_member`, `make_hardlink_member`, `make_oversized_header`, `make_many_members`, `make_bomb`, `chunked`, `noise` |
 | `backend/tests/conftest.py` | Session-scoped autouse fixture blocking `getaddrinfo`, `gethostbyname`, `create_connection`, and `socket.connect`/`connect_ex`. Raises `NetworkAccessAttempted`, a `RuntimeError` — deliberately *not* an `OSError`, so it travels straight through `assert_public_ip`'s handler instead of being swallowed as a rejection |
 | `backend/tests/` | 1065 tests across config, errors, models, logging, URL validation, net guard, GitHub client, archive reader, deadline, secret filter, path safety, parser, and the pipeline |
+| `backend/scripts/smoke.py` | Real-network end-to-end check. **Not a pytest test, on purpose** — `tests/conftest.py`'s socket block is a suite-wide guarantee, and a marker that lifted it would be an escape hatch for every future test. Prints counts only, never a specifier or a path |
 | `backend/app/api/` | Still an empty package |
 | `backend/app/security/` | HMAC tokens still to come |
 | `.claude/settings.local.json` | Local tool permissions, not source |
@@ -67,7 +68,7 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 - **The parser's real hazard is the query, not the parse.** tree-sitter's query engine is quadratic in the *width* of an ERROR node. A 1 MiB file of `(` parses in 0.23 s and then takes ~11 minutes to query; measured 0.09 / 0.95 / 3.97 s at 10k / 40k / 80k children. Every pattern costs the same, so it is the traversal, not the pattern — and nesting depth is *not* the trigger (20 000 levels query in 4 ms). `_is_pathological` refuses that shape. Worst case across a 21-input hostile sweep is now ~3.3 s per file, which is parse time. **A single file can still occupy a worker for a few seconds**, and the 60 s deadline stops the next file rather than the current one.
 - **`path_safety.py` still has no caller**, by design — nothing writes to disk. `secret_filter.py` now has exactly one, in the pipeline; its SECURITY.md row needs the `/api/source` call site too before it can leave `Partial`.
 - **Parser-level skips are invisible to the pipeline, so they are absent from the skip counts.** `extract_imports` reports a skipped file — oversized, binary, pathologically malformed — by yielding nothing, which the pipeline cannot distinguish from a file with no imports. Such a file therefore stays in the analysis as a node with its real bytes and line count and zero imports. That is honest (it *is* a real file) but it means `skipped` counts only the archive reader's drops, secret-filtered paths, and unsupported extensions. Closing it means changing `extract_imports`' signature to report skips; a test pins the current behaviour so it is deliberate rather than incidental.
-- **Nothing has been run against GitHub.** The pipeline is exercised entirely through respx with in-process tarballs. Real codeload responses, real redirect shapes, chunk sizes, and timing are all unverified.
+- **The real-GitHub run has happened, but only on the happy path.** `backend/scripts/smoke.py` analyzed three real repositories on 2026-08-31 (see Recently Completed), so codeload responses, redirect shapes, chunk sizes, and timing are no longer unverified. What is still unverified is everything adversarial: a real repository is not hostile, so no security control was *triggered*. The archive guards, the SSRF checks, and every resource cap remain fixture-only. A guard that wrongly rejects a legitimate repository would now be caught; a guard that fails to stop an attack would not.
 - **`assert_public_ip` narrows DNS rebinding, it does not close it.** The connection that follows is made by name, so a resolver that answers differently the second time is not caught. Closing it needs connect-by-IP with SNI, which v1 does not do. Recorded in `docs/SECURITY.md`.
 - **`ruff format` is not a project gate — do not run it.** `uv run ruff check .` is the gate and is clean. `ruff format --check` reports 5 of 21 files as unformatted: four pre-existing (`app/logging_setup.py`, `tests/test_config.py`, `tests/test_logging.py`, `tests/test_models.py`) and `app/security/net_guard.py`, which is unformatted for the same reason they are — the formatter wants to join wrapped constructs into lines that then exceed the configured `line-length = 100`. Running it would rewrite unrelated code to no benefit. Either adopt it repo-wide as a deliberate decision or leave it alone; do not apply it to one file.
 - The contract layer is unexercised by any route — nothing constructs an `AnalyzeResponse` from real data yet, so field *semantics* are only as good as the documentation.
@@ -75,6 +76,25 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 - The pydantic **mypy plugin is not enabled** (no `plugins` key in `[tool.mypy]`). Constructor type-checking still works via PEP 681 `@dataclass_transform` on pydantic's metaclass. Reviewed and judged unnecessary; do not assume the plugin is present when reading type errors.
 
 ## Recently Completed
+
+- **2026-08-31** — **The pipeline was run against real GitHub repositories for the first time.** `backend/scripts/smoke.py` added; `[tool.mypy] files` extended to cover `scripts`. No production code changed — the pipeline worked on the first real run.
+
+  Results, on Python 3.14.7:
+
+  | Repository | Files | Imports | Elapsed | Skipped |
+  |---|---|---|---|---|
+  | `sindresorhus/p-limit` | 6 (4 js / 2 ts) | 24 | 1.5 s | 1 secret, 9 unsupported |
+  | `pmndrs/zustand` | 50 (16 js / 34 ts) | 163 | 2.2 s | 94 unsupported |
+  | `sindresorhus/ky` | 54 (54 ts) | 186 | 2.0 s | 1 secret, 15 unsupported |
+
+  `RepositoryNotFoundError` was confirmed against a genuinely nonexistent repository and `NoSupportedFilesError` against `octocat/Hello-World`. Every commit SHA was harvested from the archive root, which is the ADR-011 channel working on data we did not construct.
+
+  Things worth carrying forward:
+  - **It is deliberately not a pytest test.** `tests/conftest.py` blocks the socket entry points at session scope and its docstring makes that a guarantee rather than a default — a per-test `monkeypatch` undo restores the *block*, not the real socket. A `network` marker that lifted it would place an escape hatch in the one place the project promises there is none, and the hatch would then be available to every future test. A separate entry point keeps the suite hermetic by construction, which is the same "eliminate the class rather than defend against it" reasoning as ADR-009.
+  - **The one secret-filtered file in two of the three repositories is `.npmrc`**, and that is correct rather than a false positive: npm writes `//registry.npmjs.org/:_authToken=…` into exactly that file. Worth recording because a filtered count of 1 on a repository with no secrets looks like a bug until you check.
+  - **`.github/` is *not* caught by the `.git` directory rule.** `_EXCLUDED_DIRS` is exact set membership, not a prefix test, so `.github/workflows/main.yml` falls through to `unsupported_extension` as it should. This was the first thing checked when the skip count looked surprising; had the rule been a prefix, every composite GitHub Action's `index.js` would have silently vanished from the graph.
+  - **Timing has a lot of headroom.** 54 files in 2.0 s against a 60 s budget, so the deadline is nowhere near binding on repositories of this size. That says nothing about the 3000-file case.
+  - **The smoke output prints counts and extensions only** — never a specifier, never a path, never a token — because it is the kind of output that gets pasted into an issue. The `probe` that listed paths to explain the `.npmrc` count was a scratch file and is not checked in.
 
 - **2026-08-30** — **Analysis pipeline implemented**: `app/analysis/pipeline.py` plus 60 tests, an `ArchiveInfo` out-parameter on `fetch/archive.py` with 9 more tests, and ADR-011 and ADR-012. **This is the commit in which the project stopped being a pile of modules.** Nothing before it had downloaded a repository or parsed one outside a test; `is_secret_path` and `extract_imports` had no callers at all.
 
@@ -189,10 +209,10 @@ Two `pyproject.toml` corrections were needed: `[tool.ruff] src = ["."]` (it was 
 2. **`app/analysis/graph_builder.py`.** Nodes, `parent` hierarchy (ADR-006), external/unresolved counts (ADR-005), the `MAX_NODES`/`MAX_EDGES` caps, and the determinism guarantees the pipeline deliberately does not provide — sorting, dedup, self-edge removal, and `stats.dependencies == len(edges)`.
 3. **`app/api/`** — routes, body-size middleware, rate limiter, concurrency gate, error handlers. Wire `AppError` into a FastAPI exception handler and map `RequestValidationError` to a bare `INVALID_REQUEST`; pydantic's `detail` embeds the offending input and must never be returned. This is also where `analyze_repository` gets its worker thread and its `asyncio.wait_for` net.
 4. **`POST /api/source` + HMAC tokens** — and with it the *second* `is_secret_path` call site, which is what lets that SECURITY.md row leave `Partial`.
-5. **Run it against a real repository.** Everything is respx and in-process tarballs today. Real codeload responses, redirect shapes, chunk sizes, and timing are unverified.
+5. **Adversarial coverage against a hostile repository.** The happy path is now verified against real GitHub (`backend/scripts/smoke.py`); what remains is a repository built to attack the guards, since the fixture suite is the only thing that has ever triggered one.
 
 The tree-sitter spike is **fully done**: ABI 14, `QueryCursor` present, and `progress_callback` **unusable** (ADR-010). Nothing about tree-sitter remains unverified.
 
 ## Last Updated
 
-2026-08-30
+2026-08-31
