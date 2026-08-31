@@ -39,8 +39,8 @@ def _within_summary_limit(value: str) -> str:
     return value
 
 
-def _within_c4_limit(value: str) -> str:
-    if len(value) > get_settings().MAX_C4_CHARS:
+def _within_diagram_limit(value: str) -> str:
+    if len(value) > get_settings().MAX_COMPONENT_DIAGRAM_CHARS:
         raise ValueError("value is longer than the configured maximum diagram length")
     return value
 
@@ -49,7 +49,7 @@ RepositoryUrl = Annotated[str, Field(min_length=1), AfterValidator(_within_url_l
 MemberPath = Annotated[str, Field(min_length=1), AfterValidator(_within_path_limit)]
 CommitSha = Annotated[str, Field(pattern=_COMMIT_SHA_PATTERN)]
 EndpointSummary = Annotated[str, Field(min_length=1), AfterValidator(_within_summary_limit)]
-C4Source = Annotated[str, Field(min_length=1), AfterValidator(_within_c4_limit)]
+ComponentDiagramSource = Annotated[str, Field(min_length=1), AfterValidator(_within_diagram_limit)]
 # Deliberately a character class rather than a Literal of the known verbs. The
 # detector is ours and may learn a router defining a method we did not
 # enumerate; refusing to *describe* a route we successfully found would be a
@@ -73,14 +73,13 @@ class AnalyzeRequest(BaseModel):
 
 
 class ServiceEndpoint(BaseModel):
-    """One HTTP route in the service map (ADR-012).
+    """One HTTP route in the service map (ADR-012, amended by ADR-013).
 
     ``method``, ``path``, ``file`` and ``line`` are structural facts produced
-    by the deterministic route-detection query. ``summary`` is the only
-    LLM-authored field here, and it is optional on purpose: the narration call
-    is an enhancement over a service map that is already complete without it,
-    so a failed or disabled LLM must degrade to unsummarized routes rather
-    than to no routes.
+    by the deterministic route-detection query. ``summary`` is quoted from the
+    repository -- the comment immediately above the route handler -- and is
+    optional because most handlers have no such comment. Absent is the
+    ordinary case, not a degraded one.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -109,12 +108,15 @@ class AnalyzeResponse(BaseModel):
     nodes: list[GraphNode]
     edges: list[GraphEdge]
     stats: Stats
-    # ADR-012 narration, appended after the graph is final and never feeding
-    # back into it. Both default to "absent" so that an LLM failure yields a
-    # valid response carrying the whole deterministic graph instead of a 500:
-    # the graph is the product, the narration is commentary on it.
+    # Derived from the finished graph and never feeding back into it, so the
+    # graph stays a pure function of the commit (ADR-012, amended by ADR-013:
+    # both are deterministic -- the service map from a route-detection query,
+    # the diagram generated from the graph itself). Both default to absent
+    # because a repository may define no routes at all, which is not a
+    # failure. `componentDiagram` was named `c4` under ADR-012; it is a
+    # structural component sketch, not a C4 model, and the name now says so.
     serviceMap: Annotated[list[ServiceEndpoint], AfterValidator(_within_endpoint_limit)] = []
-    c4: C4Source | None = None
+    componentDiagram: ComponentDiagramSource | None = None
 
 
 class SourceRequest(BaseModel):

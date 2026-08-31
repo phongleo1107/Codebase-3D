@@ -85,6 +85,43 @@ def test_full_file_node_round_trips() -> None:
     assert GraphNode.model_validate(node.model_dump()) == node
 
 
+def test_node_description_defaults_to_absent() -> None:
+    """ADR-013: the description is quoted from the file's own header comment,
+    and most files have none. Absent is the common case."""
+    node = GraphNode.model_validate(VALID_EXAMPLES[GraphNode])
+    assert node.description is None
+
+
+def test_node_description_round_trips_and_rejects_empty() -> None:
+    """`min_length=1` collapses "the author wrote an empty comment" into the
+    same representation as "the author wrote nothing" — one way to say absent,
+    so a consumer never has to test for both."""
+    node = GraphNode.model_validate(
+        {**VALID_EXAMPLES[GraphNode], "description": "Entry point for the CLI."}
+    )
+    assert node.description == "Entry point for the CLI."
+    assert GraphNode.model_validate(node.model_dump()) == node
+
+    with pytest.raises(ValidationError):
+        GraphNode.model_validate({**VALID_EXAMPLES[GraphNode], "description": ""})
+
+
+def test_node_description_bound_tracks_configured_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bound is read from Settings, not restated as a literal. It matters
+    more here than for the other caps: a description is repository content, so
+    this is the boundary between an attacker-controlled comment and a response
+    body. The extractor truncates before this point; the model is the backstop."""
+    monkeypatch.setattr(
+        "app.models.graph.get_settings", lambda: Settings(MAX_DESCRIPTION_CHARS=10)
+    )
+
+    GraphNode.model_validate({**VALID_EXAMPLES[GraphNode], "description": "d" * 10})
+    with pytest.raises(ValidationError):
+        GraphNode.model_validate({**VALID_EXAMPLES[GraphNode], "description": "d" * 11})
+
+
 def test_directory_node_carries_aggregates_and_root_parent_is_none() -> None:
     node = GraphNode.model_validate(
         {
@@ -288,28 +325,29 @@ def test_serialization_is_deterministic_and_key_order_is_schema_order() -> None:
     assert canonical.index('"repository"') < canonical.index('"nodes"') < canonical.index('"edges"')
 
 
-def test_narration_fields_default_to_absent() -> None:
-    """ADR-012: the LLM narrates over a graph that is already complete. A
-    failed or disabled narration call must degrade to a valid response
-    carrying the whole deterministic graph, never to a failed analysis."""
+def test_derived_fields_default_to_absent() -> None:
+    """ADR-013: both are derived from a graph that is already complete, and a
+    repository may legitimately define no routes at all. Absent is an ordinary
+    outcome, not a degraded one, so neither may be required."""
     response = AnalyzeResponse.model_validate(VALID_EXAMPLES[AnalyzeResponse])
     assert response.serviceMap == []
-    assert response.c4 is None
+    assert response.componentDiagram is None
 
 
 def test_service_endpoint_summary_is_optional() -> None:
-    """The route is deterministic tree-sitter output; only `summary` is
-    LLM-authored, so the service map must survive the narration failing."""
+    """Route detection is deterministic tree-sitter output; `summary` is quoted
+    from the comment above the handler (ADR-013), and most handlers have none,
+    so the service map must be complete without it."""
     endpoint = ServiceEndpoint.model_validate(VALID_EXAMPLES[ServiceEndpoint])
     assert endpoint.summary is None
     assert endpoint.method == "GET"
 
 
-def test_populated_narration_round_trips() -> None:
+def test_populated_derived_fields_round_trip() -> None:
     payload = {
         **VALID_EXAMPLES[AnalyzeResponse],
         "serviceMap": [{**VALID_EXAMPLES[ServiceEndpoint], "summary": "Fetch one user."}],
-        "c4": "C4Context\n  title Example\n",
+        "componentDiagram": "graph TD\n  api --> db\n",
     }
     response = AnalyzeResponse.model_validate(payload)
     assert response.serviceMap[0].summary == "Fetch one user."
@@ -335,16 +373,20 @@ def test_service_endpoint_rejects_empty_strings(field: str) -> None:
         ServiceEndpoint.model_validate({**VALID_EXAMPLES[ServiceEndpoint], field: ""})
 
 
-def test_narration_bounds_track_configured_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_derived_field_bounds_track_configured_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """Same discipline as the URL and path bounds: config.py owns every limit,
-    so a hardcoded copy here would ignore an operator tightening it. These
-    bound what the LLM layer may put in a response body — an unbounded string
-    from a model is still an unbounded string."""
-    tightened = Settings(MAX_C4_CHARS=10, MAX_ENDPOINT_SUMMARY_CHARS=5, MAX_SERVICE_ENDPOINTS=1)
+    so a hardcoded copy here would ignore an operator tightening it. Under
+    ADR-013 these bound *repository-authored* text on its way into a response
+    body — a comment is attacker-controlled and can be arbitrarily long."""
+    tightened = Settings(
+        MAX_COMPONENT_DIAGRAM_CHARS=10, MAX_ENDPOINT_SUMMARY_CHARS=5, MAX_SERVICE_ENDPOINTS=1
+    )
     monkeypatch.setattr("app.models.api.get_settings", lambda: tightened)
 
     with pytest.raises(ValidationError):
-        AnalyzeResponse.model_validate({**VALID_EXAMPLES[AnalyzeResponse], "c4": "C" * 11})
+        AnalyzeResponse.model_validate(
+            {**VALID_EXAMPLES[AnalyzeResponse], "componentDiagram": "C" * 11}
+        )
     with pytest.raises(ValidationError):
         ServiceEndpoint.model_validate({**VALID_EXAMPLES[ServiceEndpoint], "summary": "s" * 6})
     with pytest.raises(ValidationError):

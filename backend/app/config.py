@@ -78,14 +78,20 @@ class Settings(BaseSettings):
     # --- Source preview ---
     MAX_PREVIEW_BYTES: int = 256 * 1024
 
-    # --- AI narration (ADR-012) ---
-    # Caps on LLM-authored output before it is allowed into a response body.
-    # The narration is display-only, so these bound payload size and rendering
-    # cost, not what a model is permitted to say. A "one-line summary" that
-    # arrives as a paragraph is a malfunction, and the boundary should say so.
+    # --- Repository-authored text in responses (ADR-013) ---
+    # Descriptions and route summaries are quoted from the analyzed repository
+    # -- a file's own header comment -- not generated. That makes them
+    # attacker-controlled text on its way into a response body and then into a
+    # browser, so these caps bound genuinely unbounded input: a comment can be
+    # a megabyte long, and nothing stops one from being. The description is a
+    # label, not a document; the extractor truncates to fit rather than
+    # rejecting, since a long comment is untidy, not hostile.
+    MAX_DESCRIPTION_CHARS: int = 500
     MAX_SERVICE_ENDPOINTS: int = 200
     MAX_ENDPOINT_SUMMARY_CHARS: int = 300
-    MAX_C4_CHARS: int = 20_000
+    # Mermaid source for the deterministic component diagram, generated from
+    # the finished graph (ADR-013 -- not a C4 model, hence not MAX_C4_CHARS).
+    MAX_COMPONENT_DIAGRAM_CHARS: int = 20_000
 
     # --- Rate limiting: (max requests, window seconds) per client IP ---
     RATE_LIMIT_ANALYZE: tuple[int, int] = (5, 60)

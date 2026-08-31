@@ -13,11 +13,26 @@ Field names are the wire names — the frontend zod schema mirrors this file
 verbatim, so nothing here may be renamed casually.
 """
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field
+
+from app.config import get_settings
 
 NodeType = Literal["directory", "file"]
+
+
+def _within_description_limit(value: str) -> str:
+    if len(value) > get_settings().MAX_DESCRIPTION_CHARS:
+        raise ValueError("value is longer than the configured maximum description length")
+    return value
+
+
+# Bound read from Settings at validation time, not restated as a literal --
+# the same discipline app/models/api.py follows, so tightening the limit in the
+# environment is actually enforced here. min_length=1 makes "the author wrote
+# an empty comment" and "the author wrote nothing" the same fact: None.
+Description = Annotated[str, Field(min_length=1), AfterValidator(_within_description_limit)]
 
 
 class GraphNode(BaseModel):
@@ -31,6 +46,12 @@ class GraphNode(BaseModel):
     parent: str | None
     depth: int = Field(ge=0)
     language: str | None = None
+    # The file's own leading header comment, quoted from the repository and
+    # never generated (ADR-013). None is the ordinary case -- most files carry
+    # no header comment -- so this is optional by nature, not as a degraded
+    # fallback. Repository content: normalized and truncated at extraction,
+    # and rendered as a text node, never as HTML.
+    description: Description | None = None
 
     # File metadata (None on directory nodes).
     bytes: int | None = Field(default=None, ge=0)
