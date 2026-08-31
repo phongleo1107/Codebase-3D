@@ -79,6 +79,8 @@ Layout stays on the client because it is a presentation concern; putting it in t
 ### Status
 Accepted
 
+> **MVP scope note (2026-08-31):** under the 3-day deadline, only the first phase — deterministic nested-sphere placement over the directory tree — ships initially. The anchored force-refinement pass is deferred, not abandoned; the graph is still legible and fully deterministic without it, and adding force refinement later is additive to this same worker, not a redesign.
+
 ---
 
 ## ADR-005 — External packages are not graph nodes
@@ -132,6 +134,10 @@ A naive version of this endpoint is an arbitrary-file proxy, so it needs two ind
 ### Status
 Accepted
 
+> **MVP scope note (2026-08-31):** the raw source *viewer* UI is deferred post-MVP — three days does not fit a full read-only code panel alongside everything else. The fetch-and-filter mechanism this ADR specifies ships anyway, because [ADR-012](#adr-012--llm-generated-c4-diagrams-service-map-summaries-and-file-explanations-over-untrusted-repository-content) reuses it verbatim as the backing fetch for `POST /api/explain`. The HMAC token and the secret-filter re-application are not optional extras added later — they are load-bearing for the first caller this endpoint actually gets.
+>
+> **Second scope note (2026-08-31, later the same day — [ADR-013](#adr-013--repository-authored-descriptions-replace-the-llm-narration-layer) supersedes ADR-012):** the note above is now void. `POST /api/explain` does not exist, so this ADR has **no caller in the MVP at all**, and the entire mechanism — the endpoint, HMAC issuance and verification, and the independent re-application of `is_secret_path` at serving time — is deferred as one unit. File descriptions no longer need a re-fetch: they are extracted during the analysis pass from bytes already in memory, so no token authorizes anything and no second network path exists to guard. This ADR's design is unchanged and still governs whenever a source viewer is built; it is simply not being built now. `GraphNode.sourceToken` remains in the wire contract and stays `None`.
+
 ---
 
 ## ADR-008 — Hand-rolled rate limiter instead of `slowapi`
@@ -171,8 +177,6 @@ This is the "eliminate the vulnerability class architecturally rather than defen
 ### Status
 Accepted
 
----
-
 ## ADR-010 — Parser cost is bounded structurally; `progress_callback` is not used
 
 ### Decision
@@ -204,59 +208,108 @@ Accepted
 
 ---
 
-## ADR-011 — The archive's commit SHA travels on an out-parameter, not in the yielded tuple
+## ADR-011 — Split deployment: frontend on Vercel, backend on a persistent host
 
 ### Decision
-`app/fetch/archive.iter_source_files` keeps yielding `(PurePosixPath, bytes)`. Facts about the archive *as a whole* — the commit SHA captured from the root directory, and the per-reason skip counts — are written into an optional `ArchiveInfo` dataclass the caller passes in. The parameter defaults to `None`, so every existing three-argument call still works.
+The frontend (React/Vite) deploys to Vercel. The backend (FastAPI) deploys to a separate host that supports a long-running process and native dependencies — Railway, Render, or Fly, chosen at deploy time — not Vercel's serverless Python runtime.
 
 ### Reason
-The reader validates the root directory name (`^[A-Za-z0-9._-]+-[0-9a-f]{7,40}$`) but never returned the SHA inside it, which docs/CURRENT_STATE.md carried as a Known Issue and which blocked ingestion step 5. The pipeline needs it: it is the commit every `/api/source` fetch is pinned to, and `get_download_url` supplies one only when the ref was already a SHA — a branch ref redirects to `.../legacy.tar.gz/refs/heads/main`, which names no commit.
+A 2026-08-31 scope decision, made to hit a 3-day MVP deadline. Vercel's Python serverless functions cap execution time (10s on the free tier, 60s on Pro) and cold-start per invocation, which is a poor fit for a streaming tarball download, a tree-sitter parse, and now a per-request LLM call (ADR-012) — several of which can legitimately approach the existing 60s analysis `Deadline`. It also risks tree-sitter's native grammar wheels not loading correctly in that runtime, which would not surface until deploy time. Splitting keeps ADR-001's stateless-backend, no-database reasoning completely intact while using Vercel for what it is actually strong at: static/edge frontend hosting.
 
-Three channels were available.
-
-**A changed tuple** — `(path, content, sha)` — repeats a constant on every member. It invites a caller to read the *last* copy as authoritative rather than relying on the root-equality check that already guarantees they agree, and it rewrites the call shape in 145 existing tests to carry a value almost none of them use.
-
-**The generator's `return` value**, via `StopIteration.value`, is delivered only on exhaustion. The pipeline stops at `MAX_SOURCE_FILES` without draining the generator, so the channel would be empty in precisely the case that needs it. This is the option that looks cleanest and is wrong.
-
-**A mutable out-parameter** is filled in the moment the first accepted member establishes the root, so it survives an early break, and it costs one optional argument. Mutation-by-side-effect is the cost; it is paid down by the field being on a named dataclass whose docstring says when it is populated, and by a test that asserts the SHA is present after a single `next()`.
-
-Folding the skip counts into the same object was nearly free — `iter_source_files` already computed them for a log line and threw them away — and the pipeline needs them, because a symlink or an oversized member is a file that produced no graph node and nothing below the pipeline can count it.
+This **amends ADR-001's deployment mechanism** (`docker compose up`) for the MVP release only. Docker Compose remains the target for anyone self-hosting both services together on one machine, and should still be built once there is time to verify it end-to-end — but the fastest path to a public, working demo under this deadline is the split above.
 
 ### Alternatives considered
-- A three-element yield tuple (repeats a constant; churns every existing caller and test)
-- A generator `return` value (unavailable on the early-exit path that matters)
-- Turning the reader into a class with a `commit_sha` property (a larger interface change, and either two entry points or a rewrite of every existing call)
-- Re-deriving the SHA in the pipeline (impossible — the reader strips the root before yielding, which is the whole point)
+- Vercel serverless functions for the backend too — forces re-architecting the streaming/parsing/LLM path around short execution windows, with a real chance tree-sitter's native module fails to load in that runtime. Likely burns a full day debugging the platform rather than building features.
+- Docker Compose deploy to a single rented VM — matches ADR-001 exactly, but provisioning, securing, and pointing a domain at a VM in three days is slower than Vercel plus a PaaS free tier.
 
 ### Status
-Accepted
+Accepted (supersedes ADR-001's deployment mechanism for the MVP release; ADR-001's no-database/stateless-backend reasoning is unchanged and still governs both services)
+
+> **Note (2026-08-31, [ADR-013](#adr-013--repository-authored-descriptions-replace-the-llm-narration-layer)):** the reasoning above cites "a per-request LLM call (ADR-012)" as one of the workloads a serverless runtime fits poorly. That call no longer exists. **The decision is unaffected** — it never rested on that clause. A streaming tarball download and a tree-sitter parse under a 60 s `Deadline` are on their own a poor fit for a capped serverless execution window, and the risk that tree-sitter's native grammar wheels fail to load in that runtime is entirely unchanged. Read the LLM mention as one dropped example among several, not as load-bearing.
 
 ---
 
-## ADR-012 — The pipeline hands the graph builder a content-free file list
+## ADR-012 — LLM-generated C4 diagrams, service-map summaries, and file explanations, over untrusted repository content
 
 ### Decision
-`app/analysis/pipeline.analyze_repository` returns a `RepositoryAnalysis`: the repository coordinates, the commit SHA, a tuple of `SourceFile` (path, language, byte count, line count, and the `ImportRef`s found in it), a skip tally keyed by fixed-literal reasons, and a `truncated` flag. It carries **no file content**, no resolution, and no ordering guarantee beyond archive order.
+Add a bounded, display-only LLM layer on top of the deterministic graph:
+
+- One call per analysis produces a brief C4 Context + Container diagram, written directly in **Mermaid `C4Context`/`C4Container` syntax**, and one-line summaries for a service map.
+- The service map's endpoints themselves are found **deterministically** — a new tree-sitter query detects route-defining calls (e.g. Express `app.get/post/...`, decorator-style routers, Next.js `app/api/*/route.ts` file convention) — the LLM only narrates over that structural output, it does not decide what an endpoint is.
+- File explanations are generated **lazily**, one LLM call per file, fired only when a user opens that file's inspector panel — not upfront for every file in the repository.
+- The LLM never determines imports, edges, or any graph structure. That remains 100% deterministic tree-sitter output, per the PRD's "no LLM to determine imports or dependencies" rule, which this ADR does not touch.
+
+File content reaches the LLM through the **same fetch-and-filter mechanism ADR-007 already specified for `/api/source`**: a single-file re-fetch from `raw.githubusercontent.com` at the commit SHA pinned during analysis, gated by the same HMAC token, with `is_secret_path` re-applied before anything leaves the process. A new endpoint, `POST /api/explain`, is this mechanism's second caller — the first productized use of ADR-007's design, ahead of a raw source viewer.
 
 ### Reason
-*No content* is ADR-003 held at one more seam. `loc` and `size_bytes` are computed while the bytes are in hand precisely so nothing downstream needs to keep them; a field carrying `bytes` would make peak memory the size of the repository again and quietly undo the property the streaming reader exists to provide. A test asserts no field of `SourceFile` is `bytes`.
+The user asked for three specific reference features — a brief C4 model, an API service map, and per-file explanations — that all require summarizing *what code means*, which a pure import-graph parser cannot produce by construction. Mermaid's `C4Context`/`C4Container` syntax lets the frontend render real C4 diagrams with one library call instead of custom diagram UI, which matters under a 3-day budget.
 
-*No resolution* keeps the deterministic stages separable. Specifiers come out exactly as written, so the resolver can be built and tested against a fixture list rather than against a live download.
-
-*Only parsed files are in the list*, and this is the load-bearing consequence: resolution is set-membership against exactly this collection, so it can only ever produce a file that is also a node. Publishing a wider list — every member the archive contained — would let the resolver resolve an import to a path that was secret-filtered, vendored, or never parsed, and manufacture an edge with no node on the far end. The narrower list makes dangling edges unrepresentable rather than something the graph builder has to filter out.
-
-*Archive order, not sorted order.* docs/ARCHITECTURE.md assigns sorting, dedup, and the `stats.dependencies == len(edges)` invariant to the graph builder. Sorting here would put half of a determinism guarantee in one module and half in another.
-
-### Consequences
-The resolver will need `tsconfig.json` and workspace manifests, which this contract does not carry — those are config files, not source files, and harvesting them is a deliberate later addition to the same loop (`MAX_CONFIG_FILES` is already in `Settings` for it).
-
-`extract_imports` reports a skipped file by yielding nothing, so the pipeline cannot distinguish "parsed, no imports" from "not parsed". A file the parser gave up on therefore stays in the list as a node with real bytes, real lines, and zero imports — honest, since it is a real file, but it means parser-level skips are absent from `skipped`. Recorded in docs/CURRENT_STATE.md and pinned by a test so the behaviour is deliberate rather than incidental.
+This introduces a trust boundary `docs/SECURITY.md` did not previously cover: untrusted repository content now reaches an LLM prompt. The mitigations, recorded as new rows in `docs/SECURITY.md`:
+- File content is size-capped before inclusion in a prompt, on the same philosophy as the parser's `MAX_PARSE_BYTES`.
+- Content is wrapped in explicit delimiters with an instruction to treat it as inert data, never as instructions to follow — a prompt-injection string in a comment or a string literal can at worst produce a misleading description, never an action.
+- LLM output is rendered as plain text or as Mermaid source only, **never** as raw HTML / `innerHTML` — the same discipline the PRD already requires for source code display.
+- LLM output never controls program flow: it does not choose what to fetch, parse, filter, or render structurally. It is a leaf value, display-only, on every path.
+- The secret filter runs on the fetched file **before** it reaches the prompt, exactly as ADR-007 requires for the raw preview — a `.env` is refused for explanation for the same reason it is refused for display.
 
 ### Alternatives considered
-- Returning `(path, content)` and letting the graph builder measure (reintroduces whole-repository memory)
-- Returning every archive member so the resolver has a wider target set (allows edges to non-nodes)
-- Returning fully-built `GraphNode` objects (couples the pipeline to the wire contract and to node-ID and `sourceToken` decisions that belong to the graph builder)
-- Sorting here (splits the determinism guarantee across two modules)
+- **Heuristic-only, no LLM** — regex/AST-derived exports and JSDoc for "explanations", route detection alone (no summary) for the "service map", and no true C4 diagrams at all (they need semantic understanding no heuristic fakes convincingly). Zero ongoing API cost and no new trust boundary, but ships materially weaker versions of exactly the three features requested.
+- **Upfront LLM call per file at analysis time** — simpler code path, but multiplies cost and latency by file count for files most users never open. Lazy, on-click generation keeps spend proportional to actual use.
 
 ### Status
-Accepted
+**Superseded by [ADR-013](#adr-013--repository-authored-descriptions-replace-the-llm-narration-layer) (2026-08-31).** The LLM layer is removed from the project entirely — it did not fit the deadline, and the three features it backed are now produced deterministically instead. Nothing described above was ever implemented; the only code it reached was the wire contract (`serviceMap`, `c4`, three `Settings` limits), which ADR-013 amends rather than deletes. The reasoning above is retained because ADR-013's argument is a direct response to it.
+
+---
+
+## ADR-013 — Repository-authored descriptions replace the LLM narration layer
+
+### Decision
+
+**Remove the LLM from the system.** There is no `app/llm/`, no `POST /api/explain`, no model provider, and no API key. The PRD's "do not use an LLM to determine imports/dependencies" rule is now vacuously satisfied, because nothing in the project calls a model at all.
+
+The three features [ADR-012](#adr-012--llm-generated-c4-diagrams-service-map-summaries-and-file-explanations-over-untrusted-repository-content) introduced are kept, each re-specified as deterministic output:
+
+1. **Per-file descriptions come from the file itself.** The description is the file's own leading header comment — a JSDoc `/** … */`, a plain `/* … */` block, or an unbroken run of `//` lines — appearing before the first declaration. It is extracted from the tree-sitter tree the parser **already builds**, from bytes already in memory, during the existing single pass. A file with no such comment simply has no description. It travels as `GraphNode.description`.
+
+2. **Route summaries come from the route's own comment.** Same extractor, applied to the comment immediately preceding a detected route handler. `ServiceEndpoint.summary` survives unchanged in shape; only its provenance changes, from "the model's one-line gloss" to "what the author wrote above the handler".
+
+3. **The C4 diagram becomes a deterministic component diagram**, generated from the finished graph rather than described by a model: top-level directories become containers, external packages (ADR-005) become external systems, and detected routes become the API surface. It is emitted as Mermaid source, as before. **The field is renamed `c4` → `componentDiagram`**, because what this produces is a component/container sketch derived from structure, not a C4 model — C4 encodes *intent*, which no import graph contains. Keeping the name would have been the documentation lying about the artifact.
+
+Route *detection* is unchanged and was always deterministic; ADR-012 only ever had the LLM narrating over it.
+
+### Reason
+
+The proximate reason is the deadline: the LLM layer was most of sprint Day 2, and it did not fit. But the change is an improvement on its own terms, and would be worth making without the schedule pressure.
+
+**It deletes a trust boundary instead of defending one.** ADR-012 added the first sink for untrusted repository content other than the deterministic parser — an LLM prompt — and paid for it with five new `Planned` rows in [SECURITY.md](SECURITY.md): prompt injection, LLM output rendered as HTML, secret files reaching a prompt, cost inflation, and API-key exposure. Four of those five cease to be threats rather than becoming mitigated ones. That is CLAUDE.md's "prefer eliminating a vulnerability class architecturally over defending against it procedurally" applied to a whole feature, and it is the same reasoning as [ADR-003](#adr-003--never-write-repository-data-to-disk): the strongest control over a hazard is not having the hazard.
+
+**It makes the entire response a pure function of the commit.** With a model in the path, no golden-file test over a whole `AnalyzeResponse` is possible — the narrated fields differ run to run. Without one, the same commit produces byte-identical JSON, which is exactly the property [ARCHITECTURE.md](ARCHITECTURE.md)'s graph-model section already demands of nodes and edges and could not previously demand of the response.
+
+**It removes a network hop, a per-request cost, and a latency source** from a request that already has a 60 s budget, a streaming tarball download, and a tree-sitter parse in it.
+
+**And a header comment is a quotation, not a guess.** It is what the repository's own authors said the file is for. The trade is real and goes the other way on coverage: an uncommented file gets no description, where a model would have produced one for every file. Weaker coverage is accepted in exchange for never being wrong — a fabricated description of a file the user knows well is worse than no description at all, and it is the failure mode most visible in a demo.
+
+### The one thing this does *not* simplify
+
+Descriptions are the **first repository *content* to enter a response body.** Everything the API returned before was structure about the repository — paths, counts, line numbers — not text authored inside it. A comment is attacker-controlled text, and it is now rendered in a browser. So the ADR-012 mitigations that were about the *sink* rather than the model survive, and are re-recorded in [SECURITY.md](SECURITY.md) under a new heading:
+
+- Descriptions are size-capped (`MAX_DESCRIPTION_CHARS`) at extraction, before they reach a response model.
+- Comment markers are stripped, control characters are stripped, and the result is collapsed to a single line — a description is a label, not a document.
+- Rendering is as a React text node, **never** as an HTML string and never via `dangerouslySetInnerHTML`. This rule is inherited verbatim from ADR-012 and the PRD's rule for source display; the sink outlived the model.
+- `is_secret_path` already runs before a file is parsed, so a secret file is never parsed and therefore can never produce a description. This is a property of the existing pipeline ordering, not a new check.
+
+### Consequences
+
+- **`POST /api/explain` is removed from the design.** It was ADR-007's only in-scope caller, so the HMAC token mechanism, token issuance, and the independent re-application of `is_secret_path` at serving time all return to Deferred alongside `POST /api/source`, as one unit. See ADR-007's second scope note. `GraphNode.sourceToken` stays in the wire contract, unpopulated, belonging to that deferred design.
+- **Descriptions ship in `/api/analyze`, not from a second endpoint.** ADR-012 generated them lazily per click specifically to control model spend. With no spend to control, that machinery is pointless: the content is already in memory during the parse, so extracting it upfront costs one tree walk and removes a whole request path, a loading state, and a client-side cache.
+- **SECURITY.md's secret-exposure row can no longer flip via `/api/explain`.** It stays `Partial` until `/api/source` lands, which is now post-MVP. That is a documentation consequence, not a regression — the analysis-time filter is unchanged.
+- Sprint Day 2 loses its backend half, leaving buffer against the fact that no archive byte has yet been fetched over a real network.
+
+### Alternatives considered
+
+- **Keep the LLM layer as specified (ADR-012).** Ships stronger descriptions and genuine C4 diagrams. Rejected on the deadline first, but also on a cost the deadline made visible: a whole trust boundary, a provider dependency, a key to hold, and non-determinism in the response — all for commentary alongside a graph that is the actual product.
+- **Keep the LLM behind a feature flag, off by default.** Superficially the best of both. Rejected because the off-path is the shipped path, so the on-path is untested code that ships anyway, and every SECURITY.md row would have to stay `Planned`-but-reachable — the worst of both readings of "is this control real?".
+- **Infer descriptions heuristically** from exported symbol names, file name, and import fan-in ("a utility module imported by 12 files"). Rejected: it is fabrication with no author behind it, and it reads as generated filler precisely where a real comment would have read as documentation. If a file says nothing about itself, saying nothing is the honest output.
+- **Rename nothing and keep `c4` as the field name** for the deterministic diagram. Rejected — the field would then promise a C4 model to every frontend and schema that consumes it, and the first person to compare the output against the C4 standard would find the contract dishonest.
+
+### Status
+Accepted (supersedes ADR-012 in full; amends ADR-007's MVP scope note and the LLM clause of ADR-011's reasoning)

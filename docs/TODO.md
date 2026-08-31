@@ -1,55 +1,79 @@
 # TODO
 
-Priority order: security → correctness → core functionality → performance → UX → nice-to-have.
+> **2026-08-31 — scope changed to a 3-day MVP sprint (ADR-011, ADR-012).** Priority order is now: security → the wired end-to-end pipeline → C4/service-map/file-explanation (the three features the sprint exists to deliver) → deploy. Items below are grouped by day, not by theme. Anything not scheduled in Day 1/2/3 is **Deferred**, not cancelled — see the note at the bottom.
 
-## Now
+> **2026-08-31, later the same day — the LLM layer is cut (ADR-013 supersedes ADR-012).** The three features stay; their implementation becomes deterministic. Descriptions are the file's own leading header comment, route summaries are the comment above the handler, and the diagram is generated from the graph (field renamed `c4` → `componentDiagram`). **`POST /api/explain` and the HMAC token mechanism are out of scope**, so Day 2 loses its entire backend half and Day 1 gains one small extractor. The freed time is deliberately left as buffer — see Day 2's note.
 
-- [x] Add `.gitignore` (`.venv/`, `__pycache__/`, `node_modules/`, `dist/`, `.env`) and stage `PRD.md` — *staged, not yet committed*
-- [x] Scaffold `backend/pyproject.toml` with pinned deps and `requires-python >=3.14,<3.15` — `uv sync` green; pytest/ruff/mypy configured in the same file
-- [x] `app/config.py` — `Settings` + all limit constants
-- [x] `app/errors.py` + `app/models/` + `app/logging_setup.py` — API contract frozen; frontend work can start in parallel
-- [x] `app/security/url_validation.py` + tests (private IPs, homographs, userinfo, ports, `evil.com/github.com/o/r`)
-- [x] `app/security/net_guard.py` + tests (host equality allowlist, resolved-IP check, redirect chain) — 389 cases across the two files; `tests/conftest.py` blocks the network for the whole session
-- [x] `app/fetch/github.py` — the client that finally *calls* the guard: `follow_redirects=False`, one hop through `validate_download_url`, `assert_public_ip` before connecting, `trust_env=False`, and **no `Authorization` on the codeload request** — 88 tests, all 12 controls mutation-tested. The credential assertion the net_guard task left owing is written and passing (ADR-009)
+Priority order within each day: security → correctness → core functionality → performance → UX → nice-to-have.
 
-- [x] `app/fetch/archive.py` + `app/analysis/deadline.py` + in-process malicious-tarball fixtures — traversal (incl. backslash spellings), symlinks, hardlinks, devices, bombs, malformed names, multi-root, and every resource cap — 142 tests, 24 controls mutation-tested
+## Done before the sprint (2026-08-29)
 
-- [x] `app/security/secret_filter.py` + `path_safety.py` + tests — two golden lists plus a 20 000-path determinism sweep; path safety tested against real symlinks under `tmp_path`. 142 tests, all 18 controls mutation-tested. **Neither module has a caller** — wiring them is part of the two tasks below
+- [x] `.gitignore`, `pyproject.toml` (pinned deps, `requires-python >=3.14,<3.15`), `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py` — contract layer frozen
+- [x] `app/security/url_validation.py` + `app/security/net_guard.py` — 389 tests, SSRF/redirect/DNS-rebinding controls mutation-tested
+- [x] `app/fetch/github.py` — preflight, validated single redirect, credential-free download request (ADR-009) — 88 tests, 12 controls mutation-tested
+- [x] `app/fetch/archive.py` + `app/analysis/deadline.py` — streaming extraction, path/symlink/bomb/multi-root controls — 142 tests, 24 controls mutation-tested
+- [x] `app/security/secret_filter.py` + `app/security/path_safety.py` — 142 tests, 18 controls mutation-tested. **No caller yet** — Day 1 wires both in
+- [x] `app/analysis/parser.py` — import extraction via tree-sitter — 75 tests, 26 controls mutation-tested. **No caller yet** — Day 1 wires it in
+- [x] tree-sitter spike verified: ABI 14, `QueryCursor` present, `progress_callback` unusable (ADR-010)
 
-- [x] Verify the tree-sitter spike — ABI load (**ABI 14**), `QueryCursor` API (**present**), and `progress_callback` (**unusable — ignored for a bytes source, segfaults for a callback source; ADR-010**)
+996 tests total, nothing joined to anything else yet. This was the sprint's starting point; Day 1's first three bullets below have since closed and the modules are joined.
 
-- [x] `app/analysis/parser.py` — import extraction, incl. the negative cases a regex gets wrong — 75 tests, 26 controls mutation-tested
+## Day 1 — Backend: wire the pipeline, apply the orphaned security modules, detect routes
 
-- [x] `app/analysis/pipeline.py` — **the join**: one `Deadline` per request threaded into both consumers, `download_request()` actually sent with `stream=True`, `response.iter_raw()` into `iter_source_files`, commit SHA out of the archive root (ADR-011), `is_secret_path` on every path, grammar by extension, `MAX_SOURCE_FILES` as the parse cap, skips counted. 60 tests plus 9 for the new `ArchiveInfo` channel; 33 controls mutation-tested, 32 caught, the survivor annotated. Output contract is ADR-012
+- [x] **Wire contract extended for ADR-012** — `ServiceEndpoint`, `AnalyzeResponse.serviceMap`, `AnalyzeResponse.c4`, three `Settings` limits, 17 tests (1013 total). Both fields default to absent, so `/api/analyze` can be built and shipped before the LLM layer exists and still return a valid response
 
-## Next
+- [x] **Pipeline (`app/analysis/pipeline.py`)** — one `Deadline` per request from `Settings`, `github.download_request()` sent and streamed, `response.iter_bytes()` into `archive.iter_source_files`, commit SHA harvested from the tar root via the new `ArchiveRoot` out-parameter. 58 tests (1013 → 1071); nine controls mutation-tested, all caught. **The first code path that joins two modules**
+- [x] **`is_secret_path` applied** in the pipeline, before the bytes reach the parser, with the skips counted. The SECURITY.md secret-exposure row is **still `Partial`** and correctly so: that row describes a filter applied during analysis *and* re-applied independently at the point of serving, and `/api/explain` — the second caller — is Day 2 work. *(ADR-013, later the same day: `/api/explain` no longer exists. The second caller is now `/api/source`, which is post-MVP, so this row will not flip during the sprint. The analysis-time filter described here is unchanged and still correct.)*
+- [x] **`extract_imports` called**, grammar picked by extension (`grammar_for`). `MAX_SOURCE_FILES` enforced, truncation deterministic and flagged
+- [ ] Apply `safe_relative_path` wherever a resolved path is used for anything beyond an in-memory dict key. **Not applicable yet** — nothing touches disk (ADR-003) and no path is resolved until the resolver exists
+- [ ] Add `.mts` and `.cts` to `pipeline.grammar_for`. ARCHITECTURE.md enumerates the extension list, so the omission was preserved deliberately rather than silently widened; it is a real gap — TS ESM files are counted as skipped and never parsed
+- [ ] **Wire contract amended for ADR-013** — `c4` → `componentDiagram` (+ `MAX_C4_CHARS` → `MAX_COMPONENT_DIAGRAM_CHARS`), new `GraphNode.description` + `MAX_DESCRIPTION_CHARS`, docstrings de-LLM'd. The only place existing code contradicts the new scope
+- [ ] `app/analysis/descriptions.py` — extract a file's leading header comment (JSDoc `/** */`, `/* */`, or a run of `//`) from the tree `extract_imports` already built. Normalize **at extraction**: strip comment markers, strip control characters, collapse whitespace, truncate to `MAX_DESCRIPTION_CHARS`, return `None` when empty. Same extractor serves `ServiceEndpoint.summary` off the comment above a route handler
+- [ ] `app/analysis/resolver.py` — **MVP scope: relative imports + bare-specifier-as-external only.** No `tsconfig.json` `paths`, no `baseUrl`, no workspace packages (Deferred — see bottom). Consumes `pipeline.Ingested`: `(path, content, imports)` per file, specifiers exactly as written
+- [ ] `app/analysis/graph_builder.py` — nodes/edges per the existing model contract; deterministic sort; `stats.dependencies == len(edges)`
+- [ ] Route-detection tree-sitter query for the service map — Express `app.get/post/put/delete`, decorator-style routers, Next.js `app/api/*/route.ts` file convention. Deterministic, and now the *only* source of the service map
+- [ ] `app/analysis/component_diagram.py` — deterministic Mermaid from the finished graph: top-level directories as containers, external packages as external systems, detected routes as the API surface. Pure function of the graph, so it is golden-file testable
+- [ ] `app/api/` routes: `POST /api/analyze`, `GET /api/health`. Wire `AppError` → FastAPI exception handler; map `RequestValidationError` to a bare `INVALID_REQUEST` (pydantic's `detail` embeds the offending input and must never reach a body)
+- [ ] Golden-file test over a whole `AnalyzeResponse` — newly possible under ADR-013, since with no LLM in the path the same commit must produce byte-identical JSON
+- [ ] End-to-end smoke test against one real small public repo (first time any archive byte in this codebase comes from the network instead of a fixture)
 
-- [ ] **The second `is_secret_path` call site, in `/api/source`.** The pipeline applies it during analysis; the SECURITY.md row describes it applied *independently* in both places and stays `Partial` until the endpoint exists. A `.env` is filtered out of the graph today, but nothing yet stops a future source endpoint from serving one
-- [ ] `app/analysis/resolver.py` + `jsonc.py` — extensions, index files, `.js`→`.ts`, tsconfig `paths`, workspaces. **Includes harvesting the config files themselves**: the pipeline collects only source files, so `tsconfig.json` and workspace manifests are not yet read (`MAX_CONFIG_FILES` is in `Settings` waiting)
-- [ ] `app/analysis/graph_builder.py` — nodes, `parent` hierarchy, external/unresolved counts, `MAX_NODES`/`MAX_EDGES`, and the determinism the pipeline deliberately leaves to it: sorting, dedup, self-edge removal, `stats.dependencies == len(edges)`
-- [ ] `app/api/` — routes, body-size middleware, rate limiter, concurrency gate, error handlers. Map `RequestValidationError` to a bare `INVALID_REQUEST`: pydantic's `detail` embeds the offending input. Also where `analyze_repository` gets its worker thread and its `asyncio.wait_for` net
-- [ ] Decide `Retry-After` on 429. `AppError.__init__` takes no arguments by design (nothing dynamic can reach a body), so the header must be set by the rate limiter at the response layer, not carried on the exception
-- [ ] `POST /api/source` + HMAC tokens
-- [ ] Scaffold `frontend/` (Vite 8, React 19.2, Tailwind v4 via `@tailwindcss/vite`, TypeScript **5.9.3**)
-- [ ] Frontend types, zod schema, and a checked-in mock graph fixture so scene work can proceed without the backend
-- [ ] `layout/structural.ts` + layout worker (incl. hand-written `d3-force-3d.d.ts`)
-- [ ] `scene/` — instanced nodes, edge lines, camera rig, rAF-throttled picking, highlight buffers
-- [ ] `ui/` — landing, loading, tooltip, inspector, search, tree panel, status bar
-- [ ] Source preview via shiki `codeToTokens` → React spans (lazy-loaded)
-- [ ] `docker-compose.yml` + both Dockerfiles; verify `docker compose up` from a clean clone
-- [ ] README: architecture, security model, one-command run
+## Day 2 — Frontend
 
-## Later
+> ADR-013 removed this day's entire backend half (`app/llm/`, `/api/explain`, prompt guardrails, HMAC issuance). **The freed time is buffer, not a slot to fill** — Day 1 is now large, and no archive byte has ever been fetched over a real network, so that risk is still unmeasured. Do not pull Deferred items forward until Day 1 is green end to end.
 
-- [ ] End-to-end pass over the PRD §15 matrix (small JS, medium TS, monorepo, circular imports, malicious URLs, oversized repo, XSS payload in source)
-- [ ] **Run the pipeline against a real GitHub repository.** Everything is respx and in-process tarballs today; real codeload responses, redirect shapes, chunk sizes, and timing are unverified
-- [ ] Decide whether `extract_imports` should report skips, so parser-level drops can be counted in stats (today an unparseable file is a node with zero imports)
-- [ ] Confirm bounded RSS under `docker stats` during a large analysis
-- [ ] Confirm no repository content appears in container logs
-- [ ] Remove CSP `style-src 'unsafe-inline'` via `sheet.insertRule()` color-class mapping
-- [ ] Profile picking at 5000 nodes; add `three-mesh-bvh` only if measured to be needed
-- [ ] `frameloop="demand"` as a battery optimization
-- [ ] CI: run backend and frontend tests on push
+- [ ] Scaffold `frontend/` (Vite, React 19, TypeScript 5.9.3, Tailwind v4)
+- [ ] Frontend types + zod schema for `AnalyzeResponse`, incl. `serviceMap`, `componentDiagram`, and the optional `node.description`
+- [ ] 3D scene: instanced nodes, edge lines, camera rig — **layout is sphere-packing only for MVP** (ADR-004 scope note; force-refinement pass Deferred)
+- [ ] Inspector panel: click node → `description` (already present in the response — no second request, no loading state, no client cache) + imports/importedBy
+- [ ] Component diagram panel: render `componentDiagram` Mermaid source via the `mermaid` package
+- [ ] Service map panel: grouped list, route → file → summary where one exists
+- [ ] **Rendering guardrail:** `description`, `summary`, and the diagram source are repository content — render as React text nodes / hand the source to the Mermaid renderer. Never build an HTML string, never `dangerouslySetInnerHTML`. This is the one ADR-012 security rule that survives ADR-013, because the sink outlived the model
+
+## Day 3 — Deploy + harden
+
+- [ ] Backend → Railway/Render/Fly (ADR-011) — verify tree-sitter's native grammar wheels load in the target runtime before committing to it
+- [ ] Frontend → Vercel, `VITE_API_URL` pointed at the backend, CORS locked to the Vercel domain
+- [ ] Rate limiter + concurrency gate on `/api/analyze` (ADR-008 design) — bounds CPU and bandwidth; there is no LLM spend to bound any more
+- [ ] Body-size middleware (4 KiB cap, `content-length` **and** chunked-body byte counting)
+- [ ] Real-repo smoke test: small JS repo, medium TS repo, one with circular imports, and one whose files carry JSDoc headers (to exercise descriptions on real comments rather than fixtures)
+- [ ] Security pass: malicious URL rejected, localhost/private-IP rejected, a `.env`-containing repo produces no leaked content in the graph or response, and a repository comment containing `<script>` / control characters / a megabyte of text yields a bounded plain-text description
+- [ ] README: architecture summary, security model summary, how to run locally, link to the live Vercel URL
+
+## Deferred (post-MVP, not cancelled)
+
+- `tsconfig.json` `paths` / `baseUrl` / workspace-package resolution in `resolver.py`
+- Force-directed layout refinement pass (ADR-004 phase two)
+- `POST /api/source` raw code viewer UI — **and now the whole ADR-007 mechanism with it**: the endpoint, HMAC token issuance and verification, and the serving-time re-application of `is_secret_path`, deferred as one unit. ADR-013 deleted `/api/explain`, which was the only MVP caller keeping that machinery in scope. `GraphNode.sourceToken` stays in the wire contract and stays `None`
+- Any LLM/AI feature (ADR-012's model-written C4 diagrams, file explanations, route summaries). **Not deferred — removed.** Reinstating requires superseding ADR-013, not merely scheduling it
+- Richer description sources: directory `README.md`, `package.json` `description` for monorepo packages. Considered and deliberately excluded from MVP — the file header comment alone is the scope (ADR-013)
+- Search / tree panel, camera-focus-on-search
+- `docker-compose.yml` + both Dockerfiles, verified `docker compose up` from a clean clone (ADR-001's original target; ADR-011 is the MVP-only substitute)
+- End-to-end pass over the full PRD §15 test matrix (monorepo structure, huge repo, thousands of files, deep nesting, oversized individual file)
+- Confirm bounded RSS under load; confirm no repository content in logs
+- CSP `style-src 'unsafe-inline'` removal via `sheet.insertRule()`
+- Picking performance profiling at 5000+ nodes; `three-mesh-bvh` only if measured necessary
+- `frameloop="demand"` battery optimization
+- CI (run backend and frontend tests on push)
 
 ## Blocked
 

@@ -4,6 +4,7 @@ from app.models.api import (
     AnalyzeRequest,
     AnalyzeResponse,
     Repository,
+    ServiceEndpoint,
     SourceRequest,
     SourceResponse,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "GraphNode",
     "NodeType",
     "Repository",
+    "ServiceEndpoint",
     "SourceRequest",
     "SourceResponse",
     "Stats",

@@ -6,14 +6,19 @@
 
 **Current MVP goal:** the smallest product that feels genuinely impressive when someone pastes a repo URL and watches their codebase become a navigable 3D structure. V1 supports **TS/JS only**.
 
-> **Status: early implementation.** As of 2026-08-30 the backend has its contract layer (config, errors, models, logging), its URL/egress security boundary, the GitHub client, the streaming archive reader, the secret/path-safety filters, the import extractor, and **the analysis pipeline that joins them** (`app/analysis/pipeline.py`), with 1065 tests. A repository URL now goes in and a list of files and the module specifiers they name comes out. There is still no resolver, no graph builder, no routing, and no frontend, so nothing turns a specifier into an edge or an analysis into a response body. Two caveats worth carrying: the pipeline has only ever been driven against in-process fixtures with the HTTP transport swapped, so **nothing has been fetched from GitHub itself**; and `safe_relative_path` still has no caller, by design, while `is_secret_path` has one of the two its SECURITY.md row requires. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
+> **Status: early implementation.** As of 2026-08-31 the backend has its contract layer (config, errors, models, logging), its URL/egress security boundary, the GitHub client, the streaming archive reader, the secret/path-safety filters, the import extractor, and the **ingestion+parse pipeline that joins them** (`app/analysis/pipeline.py`), with 1074 tests. That pipeline sends the download, streams it into the reader, applies the secret filter before anything is parsed, and returns unresolved imports per file plus the commit SHA — so the fetch → extract → filter → parse half of the system is real and wired. There is still **no resolver, no graph builder, no routing, and no frontend**, no archive byte has been fetched over a real network (every test archive is built in process), and `path_safety.py` still has **no caller**. Documents describing the rest use the future tense or an explicit status marker; see [docs/CURRENT_STATE.md](docs/CURRENT_STATE.md) before assuming anything is built.
 
-**Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Three.js + React Three Fiber + Vite (frontend); Docker Compose (deploy). No database, no auth, no persistent storage.
+> **2026-08-31 — scope narrowed to a 3-day MVP sprint (ADR-011, ADR-012 in [docs/DECISIONS.md](docs/DECISIONS.md)).** *(The ADR-012 half of this note is **superseded** — see the next paragraph. Kept for history.)* Three features were added beyond the original PRD — a brief C4 diagram, an API service map, and per-file explanations, all narrated by an LLM over the deterministic graph, never used to determine it — and two amendments were made for the deadline: the frontend deploys to Vercel with the backend on a separate persistent host instead of a single `docker compose up`, and the 3D layout ships sphere-packing only, with force refinement deferred. Day-by-day plan in [docs/TODO.md](docs/TODO.md).
+
+> **2026-08-31 (later the same day) — the LLM layer is removed entirely (ADR-013 supersedes ADR-012).** It did not fit the deadline. **There is no LLM anywhere in this project**: no `app/llm/`, no `POST /api/explain`, no provider, no API key. The three features it backed survive as deterministic output — a **file's description is its own leading header comment**, quoted from the repository rather than generated; a **route's summary is the comment above the handler**; and the diagram becomes a **deterministic component diagram** built from the graph itself (top-level directories as containers, external packages as external systems, detected routes as the API surface), with the response field renamed `c4` → `componentDiagram` because it is not a C4 model. Route detection was always deterministic and is unchanged. The whole `/api/analyze` response is now a pure function of the commit.
+
+**Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Three.js + React Three Fiber + Vite + `mermaid` for the component diagram (frontend); Vercel (frontend) + a separate persistent host — Railway/Render/Fly (backend) for the MVP release (ADR-011), Docker Compose remaining the longer-term self-hosted target (ADR-001). No database, no auth, no persistent storage, **no LLM or AI API of any kind** (ADR-013).
 
 **Architectural principles**
 
-- The analyzed repository is **untrusted data**, always.
-- Deterministic parsing only. No LLM is used to determine imports or dependencies.
+- The analyzed repository is **untrusted data**, always — including its comments, which are now quoted into API responses as node descriptions (ADR-013).
+- **Deterministic analysis only, end to end.** No LLM determines imports, dependencies, graph structure, descriptions, or anything else — because the project contains no LLM at all (ADR-013). Do not reintroduce one without superseding that ADR. The same commit must produce byte-identical JSON.
+- Repository-authored text that reaches a response (descriptions, route summaries) is **display-only and bounded**: size-capped and stripped of control characters at extraction, rendered as a text node, never as HTML and never via `dangerouslySetInnerHTML`.
 - Graph analysis is independent of the visualization layer; the frontend receives structured graph data, never raw parser output.
 - Validate at every boundary — HTTP request in, GitHub response in, API response into the frontend.
 - Prefer eliminating a vulnerability class architecturally over defending against it procedurally.
@@ -39,9 +44,9 @@ backend/             Python package — contract layer, security boundary, inges
     models/          Pydantic graph and API schemas
     security/        url_validation.py, net_guard.py, secret_filter.py, path_safety.py
     fetch/           github.py (the only module that opens a socket), archive.py
-    analysis/        deadline.py, parser.py, pipeline.py (the module that joins them)
+    analysis/        deadline.py, parser.py, pipeline.py
     api/             Empty package
-  tests/             1065 tests; conftest.py blocks the network suite-wide
+  tests/             1074 tests; conftest.py blocks the network suite-wide
     fixtures/        tarballs.py — malicious archives built in process
 .claude/             Local Claude Code permissions (not source)
 ```
@@ -56,15 +61,15 @@ backend/             Python package — contract layer, security boundary, inges
 | [SECURITY.md](docs/SECURITY.md) | Threat model and control status |
 | [TODO.md](docs/TODO.md) | Prioritized backlog |
 
-`frontend/` does not exist yet, and several modules ARCHITECTURE.md describes under `backend/app/` are still unwritten — `api/` is an empty placeholder, `analysis/` holds the deadline, the parser, and the pipeline but no JSONC reader, resolver, or graph builder, and `security/` holds four of its five planned modules (HMAC tokens are missing). Create them as work begins, and update this section when you do.
+`frontend/` does not exist yet, and most modules ARCHITECTURE.md describes under `backend/app/` are still unwritten — `api/` is an empty placeholder, and `analysis/` holds the deadline, the parser, and the ingestion+parse pipeline but no resolver, graph builder, description extractor, or route detection. `security/` is **complete for the MVP** at four modules: the fifth (HMAC tokens) belonged to `/api/source` and `/api/explain`, both of which are now out of MVP scope (ADR-013, and ADR-007's second scope note). There is deliberately no `app/llm/` and there must not be one. Create modules as work begins, and update this section when you do.
 
 ## Development Rules
 
 - Prefer simple solutions over unnecessary abstraction.
 - Do not introduce a dependency without a reason. Record notable ones as an ADR.
 - Keep frontend visualization separate from graph-analysis logic.
-- Keep deterministic analysis separate from any AI functionality.
-- Treat repository contents as untrusted data.
+- **Add no AI/LLM functionality.** ADR-013 removed it; adding any back requires superseding that ADR first, not a convenient exception.
+- Treat repository contents as untrusted data — including comments, which are quoted into responses.
 - Never execute analyzed repository code.
 - Validate data at system boundaries.
 - Do not silently change architecture — see the workflow below.
