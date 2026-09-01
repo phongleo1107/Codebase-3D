@@ -705,3 +705,52 @@ Cytoscape.js is a mature, documented graph library whose public API is close to 
 
 ### Status
 Accepted
+
+---
+
+## ADR-023 — The component diagram draws containers, one unnamed external system, and routes; node ids are synthetic
+
+### Decision
+
+`app/analysis/component_diagram.build_component_diagram(nodes, edges, stats, service_map)` turns the finished graph into Mermaid `flowchart LR` source. It fixes five things ADR-013 left as a sentence.
+
+**Its input is the finished graph and the service map, and nothing else.** It is not given `RepositoryAnalysis`, and it is not given the resolver's `ResolvedImport` records.
+
+**A container is a top-level directory, derived from *file node paths* rather than from directory nodes** — the first path component, or a synthetic root container for files sitting directly in the repository. Containers are selected by file count when there are more than `_MAX_CONTAINERS`, and rendered in `PurePosixPath.parts` order so the root comes first, matching [ADR-018](#adr-018--the-repository-root-is-a-node-node-identity-is-the-path-and-directories-are-inferred).
+
+**External packages become one box with a total, not one box per package.** It is labelled `External packages · N imports`, and every container with a positive `externalImports` count points at it with its own count on the arrow.
+
+**Node identifiers are synthetic** — `c0`, `r0`, `ext`, `api`, `repo`. No repository-authored string is ever concatenated into an identifier, an arrow, or a subgraph name; repository text occupies exactly one position in the output, inside a double-quoted label, where `_label` drops non-printables and a small set of Mermaid/HTML metacharacters and caps the result.
+
+**`MAX_COMPONENT_DIAGRAM_CHARS` is enforced while writing.** `_Writer` refuses a line that would not fit; a subgraph's closing `end` is reserved before its header is written; a block that ends up with no contents is rewound; and an arrow is written only when both of its endpoints were emitted.
+
+### Reason
+
+**On the external system being singular and unnamed.** [ADR-005](#adr-005--external-packages-are-not-graph-nodes) decided that a bare specifier is a count on the importing node and never a node of its own, so by the time the graph is finished the package *names* are gone: `resolver.ResolvedImport.specifier` is the last place one exists, and this module is deliberately downstream of it. Taking the resolver's output as a second input would have bought named boxes at the price of a new class of repository-authored text in a response body — package specifiers — which is an ADR-013-sized decision about a sink, not a detail of a drawing. `graph_builder.py`'s docstring says extracting a package name from a specifier is "the component diagram's job later"; *later* is the operative word, and this is a note that the seam is understood, not that it is open. The honest drawing of a count is a box with a count in it.
+
+**On containers coming from file paths.** Reading them off directory *nodes* is the obvious implementation and it is wrong on one real input: ADR-018 resolves a `components.ts` / `components.ts/x.ts` collision in the file's favour and creates no directory node, so `x.ts`'s container would silently vanish. First-path-component needs no node to exist and cannot disagree with the node set.
+
+**On synthetic ids, which is the whole security argument.** A directory name, a route path and a route summary are all attacker-controlled (CLAUDE.md: the repository is untrusted data, *including its comments*). Sanitizing them is necessary and is done, but sanitizing is a denylist and a denylist is a claim about a grammar we did not implement. Making identifiers synthetic removes the position from which any of that text could become syntax, which is CLAUDE.md's "prefer eliminating a vulnerability class architecturally" applied to a text format — the same move [ADR-003](#adr-003--never-write-repository-data-to-disk) makes about disk. The sanitizer is then the second line, not the only one, and a test asserts the *structural* property directly by checking that no marker string appears anywhere outside a quoted label.
+
+**On the cap being applied while writing.** Truncated Mermaid is not Mermaid: cutting the string leaves an unclosed `subgraph` or a half-written label. This is [ADR-020](#adr-020--the-description-is-a-byte-prefix-scan-not-a-second-pass-over-the-ast)'s "the cap is applied while cleaning, not after", restated for output that has structure rather than output that is a label. The item caps exist for a different reason and are not the bound: a repository with 300 top-level directories has no readable component diagram at any character count, and the caps are sized so the worst legible case (measured: 8 685 characters) lands well under the 20 000 default, which keeps the character limit a safety net rather than the thing that decides ordinary output.
+
+### Consequences
+
+- **`MAX_COMPONENT_DIAGRAM_CHARS` has a producer.** It was the last limit in `Settings` that bounded nothing (docs/SECURITY.md). It is now enforced twice, as `MAX_DESCRIPTION_CHARS` is: while writing, which is the one that matters, and again by `ComponentDiagramSource` at the model boundary, which catches a future producer that forgets.
+- **The diagram is the third and last repository-authored text sink in the response**, after `GraphNode.description` and `ServiceEndpoint.summary`, and the only one where the text lands inside a *format* rather than beside one. docs/SECURITY.md's "Repository-authored text in responses" section gains its diagram half.
+- **`None` is a normal return**, for a graph with no file nodes and for a character limit too small to hold one container. `AnalyzeResponse.componentDiagram` is optional for exactly this.
+- **Ordering inside the output is a priority, not a layout.** Containers are written before routes so that a short budget spends itself on the thing ADR-013 names first; in an `LR` flowchart it is the arrows that place a box, so the picture is unaffected.
+- Like `resolver.py` and `graph_builder.py`, the module is pure and has **no logger**, both pinned by test.
+- **It has no caller.** The router is the first, and this is the third module in a row to ship in that position.
+
+### Alternatives considered
+
+- **One external system per package**, taking `tuple[ResolvedImport, ...]` as a fourth input and deriving names from specifiers (`@scope/pkg`, `lodash/fp` → `lodash`, `node:fs`). Much better for a demo. Rejected for this change: it contradicts the stated input (the finished graph), and it introduces repository-authored package names into a response body, which needs its own decision rather than arriving as a side effect of a diagram. The seam is one parameter wide if that decision is ever made.
+- **Escaping repository text rather than removing characters from it.** Mermaid has entity codes (`#quot;`), so a faithful escaper is possible. Rejected as the primary defence for the reason synthetic ids exist: an escaper is a claim about a grammar, and the grammar belongs to a renderer we do not control and a version we do not pin. Removal is lossy and legible; a broken escape is neither.
+- **Substituting a placeholder character for a removed one.** Rejected for `descriptions.py`'s reason about the ellipsis: a label is a quotation, and the substituted character would be the only text in it the repository did not write.
+- **Deriving containers from directory nodes at `depth == 1`.** One line shorter, and silently loses a container on the file/directory collision ADR-018 already decided to tolerate.
+- **Truncating the finished string to the character cap.** Produces invalid Mermaid at exactly the moment the cap matters.
+- **Emitting `<br/>` to put a route summary on its own line.** Rejected: it means writing markup into a document whose whole safety argument is that repository text never becomes markup, and then maintaining the distinction between our HTML and theirs. A hyphen costs one line of legibility and no argument.
+
+### Status
+Accepted
