@@ -42,7 +42,7 @@ from pathlib import PurePosixPath
 import pytest
 from pydantic import ValidationError
 
-from app.analysis.graph_builder import build_graph
+from app.analysis.graph_builder import GraphLimits, build_graph
 from app.analysis.pipeline import ImportRef, RepositoryAnalysis, SourceFile
 from app.analysis.resolver import Resolution, ResolvedImport, resolve_imports
 from app.config import Settings
@@ -530,6 +530,180 @@ def test_identities_hold_over_a_large_graph() -> None:
     assert node_at(nodes, ".").totalBytes == size * FILE_BYTES
     assert len({node.id for node in nodes}) == len(nodes)
     assert paths(nodes) == sorted(paths(nodes), key=lambda p: PurePosixPath(p).parts)
+
+
+# --------------------------------------------------------------------------
+# MAX_NODES / MAX_EDGES (ADR-023). The cap is opt-in, and the reason it lives
+# here rather than in the router is that everything a cap can falsify is
+# computed here. These tests are about the second half: what stays true.
+# `tests/test_api_routes.py` exercises the same caps over a whole response.
+# --------------------------------------------------------------------------
+
+
+def capped(
+    layout: Mapping[str, Sequence[str]],
+    *,
+    max_nodes: int = 10_000,
+    max_edges: int = 10_000,
+) -> tuple[tuple[GraphNode, ...], tuple[GraphEdge, ...], Stats]:
+    """Build with one cap tightened and the other lifted out of the way."""
+    analysis = make_analysis(layout)
+    return build_graph(
+        analysis,
+        resolve_imports(analysis),
+        limits=GraphLimits(max_nodes=max_nodes, max_edges=max_edges),
+    )
+
+
+# Ten files in one directory, each importing the next. Twelve nodes, nine
+# edges, and a sorted order (".", "src", "src/a0.ts" … "src/a9.ts") in which
+# every cut position is easy to state.
+CHAIN: Mapping[str, Sequence[str]] = {
+    f"src/a{i}.ts": ([f"./a{i + 1}"] if i < 9 else []) + ["react"] for i in range(10)
+}
+
+
+def test_the_cap_is_off_unless_limits_are_passed() -> None:
+    """Every other caller in the project builds the whole graph, and must keep
+    doing so — a default cap would silently truncate a direct call."""
+    nodes, edges, stats = build(CHAIN)
+    assert (len(nodes), len(edges)) == (12, 9)
+    assert stats.truncated is False
+
+
+def test_graph_limits_reads_settings_rather_than_restating_them() -> None:
+    limits = GraphLimits.from_settings(Settings(MAX_NODES=7, MAX_EDGES=9))
+    assert (limits.max_nodes, limits.max_edges) == (7, 9)
+
+
+def test_a_node_cap_keeps_a_prefix_that_is_closed_under_parent() -> None:
+    """The property the whole design rests on.
+
+    A path's parent is a prefix of it in `parts` order, so a prefix of the
+    sorted node list can never leave a survivor naming a parent that is gone.
+    Nothing else about "drop the tail" would be safe.
+    """
+    nodes, _, stats = capped(CHAIN, max_nodes=6)
+
+    assert paths(nodes) == [".", "src", "src/a0.ts", "src/a1.ts", "src/a2.ts", "src/a3.ts"]
+    assert stats.truncated is True
+    ids = {node.id for node in nodes}
+    assert all(node.parent is None or node.parent in ids for node in nodes)
+
+
+def test_a_node_cap_drops_the_edges_that_pointed_into_it() -> None:
+    """`src/a3.ts` imports `src/a4.ts`, which is gone. It must not become an
+    edge into nothing — the one outcome ADR-018 refuses everywhere else too."""
+    nodes, edges, stats = capped(CHAIN, max_nodes=6)
+
+    ids = {node.id for node in nodes}
+    assert pairs(edges) == [
+        ("src/a0.ts", "src/a1.ts"),
+        ("src/a1.ts", "src/a2.ts"),
+        ("src/a2.ts", "src/a3.ts"),
+    ]
+    assert all(edge.source in ids and edge.target in ids for edge in edges)
+    assert stats.dependencies == len(edges) == 3
+
+
+def test_a_node_cap_re_derives_every_count_from_what_survived() -> None:
+    """The assertion a naive slice of the returned tuples fails.
+
+    Each of these is a number the builder computes internally, so truncating
+    afterwards would leave all six describing a graph the caller cannot see.
+    """
+    nodes, edges, stats = capped(CHAIN, max_nodes=6)
+
+    files = [node for node in nodes if node.type == "file"]
+    assert stats.files == len(files) == 4
+    assert stats.directories == 2
+    assert stats.dependencies == len(edges)
+    assert sum(node.imports or 0 for node in files) == len(edges)
+    assert sum(node.importedBy or 0 for node in files) == len(edges)
+    # Statement counts over the *emitted* files: four kept files import `react`
+    # once each. Ten would be a total no node in the response adds up to.
+    assert stats.externalImports == sum(node.externalImports or 0 for node in files) == 4
+    assert node_at(nodes, ".").fileCount == stats.files
+    assert node_at(nodes, ".").totalBytes == 4 * FILE_BYTES
+    # The last surviving file lost the node it imported, so its counter moved
+    # with the edge rather than staying at the raw import count.
+    assert node_at(nodes, "src/a3.ts").imports == 0
+
+
+def test_an_edge_cap_leaves_the_nodes_alone_and_moves_the_counters() -> None:
+    nodes, edges, stats = capped(CHAIN, max_edges=2)
+
+    assert len(nodes) == 12, "the node cap did not fire"
+    assert pairs(edges) == [("src/a0.ts", "src/a1.ts"), ("src/a1.ts", "src/a2.ts")]
+    assert stats.truncated is True
+    assert stats.dependencies == 2
+    assert node_at(nodes, "src/a2.ts").importedBy == 1
+    assert node_at(nodes, "src/a3.ts").importedBy == 0
+    # Nodes were not capped, so no file lost its external import.
+    assert stats.externalImports == 10
+
+
+def test_a_graph_exactly_at_both_caps_is_not_truncated() -> None:
+    """The at-the-limit case, so ``>`` cannot quietly become ``>=``."""
+    _, _, stats = capped(CHAIN, max_nodes=12, max_edges=9)
+    assert stats.truncated is False
+
+    _, _, tighter = capped(CHAIN, max_nodes=11, max_edges=9)
+    assert tighter.truncated is True
+
+
+def test_a_cap_does_not_clear_a_truncation_the_analysis_already_reported() -> None:
+    analysis = make_analysis(CHAIN, truncated=True)
+    _, _, stats = build_graph(
+        analysis, resolve_imports(analysis), limits=GraphLimits(max_nodes=99, max_edges=99)
+    )
+    assert stats.truncated is True
+
+
+def test_a_directory_whose_children_all_fell_past_the_cut_survives_empty() -> None:
+    """A documented artifact, pinned so it stays deliberate.
+
+    A directory sorts before its contents, so a cut between them keeps the
+    directory with a `fileCount` of 0. Honest — the directory really is in the
+    repository — and it keeps `root.fileCount == stats.files` true.
+    """
+    nodes, _, stats = capped(CHAIN, max_nodes=2)
+
+    assert paths(nodes) == [".", "src"]
+    assert stats.files == 0
+    assert node_at(nodes, "src").fileCount == 0
+    assert node_at(nodes, ".").fileCount == stats.files
+
+
+def test_a_cap_does_not_hide_a_mispaired_caller() -> None:
+    """The preconditions are checked against the whole analysis, before the cut.
+
+    Otherwise a `ValueError` would depend on whether the bad record's file
+    happened to fall inside the cap — a programming error that reports itself
+    only sometimes is worse than one that does not report at all.
+    """
+    analysis = make_analysis(CHAIN)
+    bogus = ResolvedImport(
+        source=PurePosixPath("src/a9.ts"),
+        specifier="./elsewhere",
+        line=0,
+        resolution=Resolution.RESOLVED,
+        target=PurePosixPath("src/not-in-the-analysis.ts"),
+    )
+    with pytest.raises(ValueError, match="not in the analysis"):
+        build_graph(analysis, (bogus,), limits=GraphLimits(max_nodes=2, max_edges=2))
+
+
+def test_a_capped_graph_still_composes_into_an_analyze_response() -> None:
+    nodes, edges, stats = capped(CHAIN, max_nodes=6, max_edges=2)
+    response = AnalyzeResponse(
+        repository=Repository(owner=OWNER, name=NAME, commitSha="a" * 40),
+        nodes=list(nodes),
+        edges=list(edges),
+        stats=stats,
+    )
+    assert response.stats.truncated is True
+    assert len(response.nodes) == 6
 
 
 # --------------------------------------------------------------------------
