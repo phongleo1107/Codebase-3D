@@ -107,9 +107,12 @@ export const ServiceEndpointSchema = z.strictObject({
 
 export const AnalyzeResponseSchema = z.strictObject({
   repository: RepositorySchema,
-  // MAX_NODES / MAX_EDGES are enforced *nowhere* on the server today
-  // (docs/CURRENT_STATE.md, "Broken / Known Issues"), so these two caps are
-  // currently the only place those limits bind anything.
+  // The server enforces both as well, since ADR-023: `build_graph` is handed
+  // `GraphLimits` and builds a *smaller graph*, so the caps bind while the
+  // counters are still being derived instead of by slicing a finished result.
+  // These two are ordinary defence in depth, then — but they still have to
+  // stay in step with `Settings`, because zod rejects the whole document
+  // rather than trimming it. See `limits.ts`.
   nodes: z.array(GraphNodeSchema).max(LIMITS.MAX_NODES),
   edges: z.array(GraphEdgeSchema).max(LIMITS.MAX_EDGES),
   stats: StatsSchema,
