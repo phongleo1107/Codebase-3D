@@ -199,8 +199,46 @@ const raw = {
       line: 58,
     },
   ],
-  componentDiagram:
-    'graph LR\n  src["src"]\n  api["src/api"]\n  lib["src/lib"]\n  src --> api\n  api --> lib\n',
+  // Mermaid source, in the shape `analysis/component_diagram.py` actually
+  // emits — compare `backend/tests/fixtures/component_diagram_golden.mmd`. It
+  // is derived from the numbers above rather than invented: every file sits
+  // under `src`, so there is exactly one container holding 6 files; both
+  // service-map entries live in it; `stats.externalImports` is 5; and every
+  // import edge is within `src`, so all of them collapse to a self-pair and
+  // none is drawn.
+  //
+  // The node ids are synthetic (`c0`, `r0`, `ext`) because that is ADR-024's
+  // whole point: repository text reaches the output in exactly one position,
+  // inside a quoted label, and never in the syntax. The previous version of
+  // this fixture used `src` / `api` / `lib` as ids, which read as though
+  // directory names became identifiers. They do not.
+  //
+  // `c1` is the standing probe, and it is a deliberate deviation from
+  // "derivable from the graph above" — the same deviation the `<script>` in
+  // `utils.ts`'s description is. It CANNOT occur in a real response:
+  // `component_diagram._label` removes `< > & " # % \ ` { } | ;` from every
+  // label. It is here so `ui/ComponentDiagram.tsx`'s own layer is observable
+  // rather than merely argued: at mermaid 11.17.2 with `htmlLabels: false`,
+  // the `<script>` is dropped by mermaid's DOMPurify pass and the `<img>`
+  // survives only as literal characters in an SVG `<text>` node. If either
+  // ever renders as an element, something built markup.
+  componentDiagram: [
+    '%% Component diagram, generated from the dependency graph (ADR-013).',
+    '%% Containers are top-level directories; arrows are import counts.',
+    'flowchart LR',
+    '  subgraph repo["demo-service"]',
+    '    c0["src · 6 files"]',
+    '    c1["probe <script>alert(1)</script> <img src=x onerror=alert(1)>"]',
+    '  end',
+    '  subgraph api["API surface"]',
+    '    r0["GET /users/:id - Fetch one user by id."]',
+    '    r1["POST /users"]',
+    '  end',
+    '  ext["External packages · 5 imports"]',
+    '  r0 --> c0',
+    '  r1 --> c0',
+    '  c0 -->|5| ext',
+  ].join('\n'),
 }
 
 export const FIXTURE_RESPONSE: AnalyzeResponse = AnalyzeResponseSchema.parse(raw)

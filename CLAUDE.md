@@ -16,7 +16,7 @@
 
 > **2026-08-31 (later the same day) — the LLM layer is removed entirely (ADR-013 supersedes ADR-012).** It did not fit the deadline. **There is no LLM anywhere in this project**: no `app/llm/`, no `POST /api/explain`, no provider, no API key. The three features it backed survive as deterministic output — a **file's description is its own leading header comment**, quoted from the repository rather than generated; a **route's summary is the comment above the handler**; and the diagram becomes a **deterministic component diagram** built from the graph itself (top-level directories as containers, external packages as external systems, detected routes as the API surface), with the response field renamed `c4` → `componentDiagram` because it is not a C4 model. Route detection was always deterministic and is unchanged. The whole `/api/analyze` response is now a pure function of the commit.
 
-**Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Cytoscape.js (2D graph) + Vite + `mermaid` for the component diagram (frontend); Vercel (frontend) + a separate persistent host — Railway/Render/Fly (backend) for the MVP release (ADR-011), Docker Compose remaining the longer-term self-hosted target (ADR-001). No database, no auth, no persistent storage, **no LLM or AI API of any kind** (ADR-013).
+**Planned technologies:** Python 3.14 + FastAPI + tree-sitter (backend); React 19 + TypeScript + Cytoscape.js (2D graph) + Vite + `mermaid` 11.17.2 for the component diagram — a real pinned dependency as of 2026-09-01, not a plan (frontend); Vercel (frontend) + a separate persistent host — Railway/Render/Fly (backend) for the MVP release (ADR-011), Docker Compose remaining the longer-term self-hosted target (ADR-001). No database, no auth, no persistent storage, **no LLM or AI API of any kind** (ADR-013).
 
 **Architectural principles**
 
@@ -58,7 +58,9 @@ backend/             Python package — contract layer, security boundary, inges
     fixtures/        tarballs.py — malicious archives built in process;
                      component_diagram_golden.mmd — the one golden file
 frontend/            React scaffold — renders a fixture; no backend call yet
-  package.json       Exact-pinned deps; package-lock.json committed
+  package.json       Exact-pinned deps; package-lock.json committed. `mermaid`
+                     11.17.2 is by far the largest of them — 159 transitive
+                     packages, including a second copy of `cytoscape`
   tsconfig.json      strict + exactOptionalPropertyTypes
   vite.config.ts     React + Tailwind v4 plugins
   index.html
@@ -66,7 +68,8 @@ frontend/            React scaffold — renders a fixture; no backend call yet
     api/             schema.ts (zod mirror of the wire contract), limits.ts
     graph/           elements.ts (wire graph -> Cytoscape), fixture.ts
     scene/           GraphCanvas.tsx, style.ts
-    ui/              App.tsx, Inspector.tsx
+    ui/              App.tsx, Inspector.tsx, ComponentDiagram.tsx (written and
+                     browser-verified; nothing imports it yet — ADR-025)
     store/           graphStore.ts
 .claude/             Local Claude Code permissions, launch config, worktrees
                      (not source; gitignored)
@@ -82,7 +85,7 @@ frontend/            React scaffold — renders a fixture; no backend call yet
 | [SECURITY.md](docs/SECURITY.md) | Threat model and control status |
 | [TODO.md](docs/TODO.md) | Prioritized backlog |
 
-`frontend/` is a scaffold, not the frontend ARCHITECTURE.md describes — there is no landing page, no API client, no diagram or service-map panel, no search, no collapse/expand, and **no tests**. Under `backend/app/`, `api/` now holds the two MVP endpoints, the middleware, and the exception handlers — but **not** the rate limiter, the concurrency gate, or CORS, all of which ARCHITECTURE.md lists there and all of which are Day 3 — and `analysis/` is **complete for the MVP** at eight modules: the deadline, the parser, the ingestion+parse pipeline, the MVP resolver, the description extractor, the graph builder, route detection, and the component-diagram generator. `security/` is **complete for the MVP** at four modules: the fifth (HMAC tokens) belonged to `/api/source` and `/api/explain`, both of which are now out of MVP scope (ADR-013, and ADR-007's second scope note). There is deliberately no `app/llm/` and there must not be one. Create modules as work begins, and update this section when you do.
+`frontend/` is a scaffold, not the frontend ARCHITECTURE.md describes — there is no landing page, no API client, no service-map panel, no search, no collapse/expand, and **no tests**. *(**Corrected 2026-09-01**: this sentence used to say "no diagram or service-map panel". Half of that is now false. `src/ui/ComponentDiagram.tsx` exists — it renders `componentDiagram` through `mermaid` 11.17.2, adopting the returned SVG out of an inert `DOMParser` document behind an element allowlist rather than injecting it as HTML, and it was driven in a real browser including all four of its refusal paths (ADR-025). But **nothing imports it**: it is not in `App.tsx`'s layout, so the app as it runs still shows only the canvas and the inspector. The service-map panel still does not exist. "No tests" is unchanged and is now the sharper gap — the browser evidence behind that panel is manual and not repeatable.)* Under `backend/app/`, `api/` now holds the two MVP endpoints, the middleware, and the exception handlers — but **not** the rate limiter, the concurrency gate, or CORS, all of which ARCHITECTURE.md lists there and all of which are Day 3 — and `analysis/` is **complete for the MVP** at eight modules: the deadline, the parser, the ingestion+parse pipeline, the MVP resolver, the description extractor, the graph builder, route detection, and the component-diagram generator. `security/` is **complete for the MVP** at four modules: the fifth (HMAC tokens) belonged to `/api/source` and `/api/explain`, both of which are now out of MVP scope (ADR-013, and ADR-007's second scope note). There is deliberately no `app/llm/` and there must not be one. Create modules as work begins, and update this section when you do.
 
 ## Development Rules
 
