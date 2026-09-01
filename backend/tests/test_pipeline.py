@@ -682,6 +682,8 @@ def test_tsx_file_gets_the_tsx_grammar(client: httpx.Client) -> None:
 SUPPORTED = [
     ("src/a.ts", TYPESCRIPT),
     ("src/a.tsx", TYPESCRIPT),
+    ("src/a.mts", TYPESCRIPT),
+    ("src/a.cts", TYPESCRIPT),
     ("src/a.js", JAVASCRIPT),
     ("src/a.jsx", JAVASCRIPT),
     ("src/a.mjs", JAVASCRIPT),
@@ -707,10 +709,10 @@ UNSUPPORTED = [
     "styles.css",
     "script.py",
     "logo.svg",
-    # Deliberately outside the v1 set docs/ARCHITECTURE.md fixes. Pinned so
-    # that widening it is an edit somebody makes on purpose.
-    "src/a.mts",
-    "src/a.cts",
+    # Neighbours of the supported set, so widening it stays deliberate: `.cts`
+    # and `.mts` joined it on 2026-09-01 and these did not.
+    "src/a.ets",
+    "src/a.ts.bak",
     # No extension at all.
     "Makefile",
 ]

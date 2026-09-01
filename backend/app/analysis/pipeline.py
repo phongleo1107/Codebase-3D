@@ -141,12 +141,17 @@ JAVASCRIPT: Final = "javascript"
 # loses the same way under the TypeScript grammar. Both directions are pinned by
 # test.
 #
-# `.mts` and `.cts` are deliberately absent — docs/ARCHITECTURE.md fixes the v1
-# set at these six, and quietly widening it here would put the code and the
-# document out of step. Adding them is this dict plus a doc edit.
+# `.mts` and `.cts` take the *TypeScript* grammar, not TSX, for the same reason
+# `.ts` does: TypeScript only reads JSX in a file named `.tsx`, so `<T>expr` in
+# an `.mts` file is a type assertion and TSX would swallow the rest of the file
+# into an ERROR node. They were absent until 2026-09-01 — the v1 list in
+# docs/ARCHITECTURE.md omitted them — and widening it needs `resolver.EXTENSIONS`
+# widened in the same edit; a test asserts the two name the same extensions.
 _BY_EXTENSION: Final[dict[str, tuple[Language, str]]] = {
     ".ts": (_TS_GRAMMAR, TYPESCRIPT),
     ".tsx": (_TSX_GRAMMAR, TYPESCRIPT),
+    ".mts": (_TS_GRAMMAR, TYPESCRIPT),
+    ".cts": (_TS_GRAMMAR, TYPESCRIPT),
     ".js": (_TSX_GRAMMAR, JAVASCRIPT),
     ".jsx": (_TSX_GRAMMAR, JAVASCRIPT),
     ".mjs": (_TSX_GRAMMAR, JAVASCRIPT),

@@ -146,9 +146,11 @@ def parse_source(
     file was skipped and a reason was logged.
 
     ``language`` selects the grammar and is the caller's choice: the TSX
-    grammar is a superset covering ``.tsx .js .jsx .mjs .cjs``, while ``.ts``
-    needs the TypeScript grammar, whose ``<T>expr`` type assertion TSX would
-    read as JSX. It is recoverable from the result — ``tree.language`` is the
+    grammar is a superset covering ``.tsx .js .jsx .mjs .cjs``, while
+    ``.ts .mts .cts`` need the TypeScript grammar, whose ``<T>expr`` type
+    assertion TSX would read as JSX — TypeScript reads JSX only in a file named
+    ``.tsx``, so the module-kind variants side with ``.ts``. It is recoverable
+    from the result — ``tree.language`` is the
     identical object, which is what lets `extract_imports` and
     `analysis/routes.detect_routes` take a tree alone and still find their
     compiled query in the cache.
