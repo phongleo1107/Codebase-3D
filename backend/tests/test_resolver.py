@@ -122,15 +122,70 @@ def test_jsx_rewrites_to_tsx_before_the_literal() -> None:
 
 
 def test_mjs_does_not_rewrite_to_ts() -> None:
-    """`./util.mjs` means `util.mts`, which is not analyzed — so: unresolved.
+    """`./util.mjs` means `util.mts` and nothing else — so here: unresolved.
 
-    Pins the deliberate absence of an `.mjs` -> `.ts` rewrite. Adding one would
-    resolve a TS-ESM `.mjs` import to a CommonJS-era `.ts` file that TypeScript
-    itself would not have chosen. The pair that *is* correct, `.mjs` -> `.mts`,
-    is unreachable while `_BY_EXTENSION` omits `.mts` (TODO.md).
+    Pins the deliberate absence of an `.mjs` -> `.ts` rewrite, which survived
+    adding `.mjs` -> `.mts`. The extension in the specifier names the module kind
+    the compiler will emit, and only an `.mts` source emits an `.mjs`; resolving
+    to a plain `.ts` would draw the edge to a file TypeScript itself would not
+    have chosen.
     """
     answer = resolve_one("./util.mjs", tree=["src/util.ts"])
     assert answer.resolution is Resolution.UNRESOLVED
+
+
+def test_cjs_does_not_rewrite_to_ts() -> None:
+    """The same rule in the CommonJS direction: `./util.cjs` is not `util.ts`."""
+    answer = resolve_one("./util.cjs", tree=["src/util.ts"])
+    assert answer.resolution is Resolution.UNRESOLVED
+
+
+def test_mjs_rewrites_to_mts_before_the_literal() -> None:
+    """`./util.mjs` is `util.mts` when both it and the emitted `.mjs` exist.
+
+    The headline `.js` -> `.ts` case, in the module-kind-bearing spelling. Both
+    candidates exist in the fixture, so flipping the order fails it rather than
+    merely finding nothing.
+    """
+    assert target_of("./util.mjs", tree=["src/util.mts", "src/util.mjs"]) == "src/util.mts"
+
+
+def test_cjs_rewrites_to_cts_before_the_literal() -> None:
+    assert target_of("./util.cjs", tree=["src/util.cts", "src/util.cjs"]) == "src/util.cts"
+
+
+def test_literal_mjs_resolves_when_no_mts_source_exists() -> None:
+    """The rewrite is a preference, not a replacement — plain `.mjs` still wins."""
+    assert target_of("./util.mjs", tree=["src/util.mjs"]) == "src/util.mjs"
+
+
+def test_literal_cjs_resolves_when_no_cts_source_exists() -> None:
+    assert target_of("./util.cjs", tree=["src/util.cjs"]) == "src/util.cjs"
+
+
+def test_mts_and_cts_resolve_literally() -> None:
+    """A specifier that already names a TS ESM source needs no rewrite at all."""
+    assert target_of("./util.mts", tree=["src/util.mts"]) == "src/util.mts"
+    assert target_of("./util.cts", tree=["src/util.cts"]) == "src/util.cts"
+
+
+def test_extensionless_specifier_reaches_an_mts_file() -> None:
+    """`./util` -> `util.mts` via the extension-append step, not the rewrite.
+
+    The step that made `.mts` unreachable before it was analyzed: the candidate
+    was generated, missed the set, and there was no way for it to be a node.
+    """
+    assert target_of("./util", tree=["src/util.mts"]) == "src/util.mts"
+    assert target_of("./util", tree=["src/util.cts"]) == "src/util.cts"
+
+
+def test_mts_directory_index_resolves() -> None:
+    assert target_of("./util", tree=["src/util/index.mts"]) == "src/util/index.mts"
+
+
+def test_ts_beats_mts_when_a_bare_specifier_could_mean_either() -> None:
+    """Extension-append order, at the pair that `.mts` joining the list created."""
+    assert target_of("./util", tree=["src/util.mts", "src/util.ts"]) == "src/util.ts"
 
 
 def test_extension_order_is_ts_first() -> None:

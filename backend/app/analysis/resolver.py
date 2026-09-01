@@ -53,7 +53,8 @@ lowercase literals. Accepted; see docs/CURRENT_STATE.md.
 For a relative specifier joined against the importing file's directory, in
 order, first hit wins:
 
-1. **TS ESM rewrite** — ``.js`` → ``.ts``, ``.tsx``; ``.jsx`` → ``.tsx``.
+1. **TS ESM rewrite** — ``.js`` → ``.ts``, ``.tsx``; ``.jsx`` → ``.tsx``;
+   ``.mjs`` → ``.mts``; ``.cjs`` → ``.cts``.
 2. **The path literally**, if it already carries an extension we analyze.
 3. **The path plus each extension**, in the order given by `EXTENSIONS`.
 4. **The path as a directory**, plus ``index`` and each extension.
@@ -104,17 +105,34 @@ from app.analysis.pipeline import ImportRef, RepositoryAnalysis
 # bar rather than a silent class of unresolvable import: an extension the
 # pipeline parses but this tuple omits produces a node nothing can link to.
 #
-# `.mts` and `.cts` are absent for the same reason they are absent from
-# `_BY_EXTENSION` — see TODO.md. When they are added there, add them here and
-# add the `.mjs` -> `.mts` / `.cjs` -> `.cts` rewrites below in the same edit.
-EXTENSIONS: Final[tuple[str, ...]] = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+# TypeScript extensions come first, and `.cjs` stays last — a test distinguishes
+# the two orderings by pitting the last file candidate against the first
+# directory one.
+EXTENSIONS: Final[tuple[str, ...]] = (
+    ".ts",
+    ".tsx",
+    ".mts",
+    ".cts",
+    ".js",
+    ".jsx",
+    ".mjs",
+    ".cjs",
+)
 
 # TS ESM: the specifier names the file the compiler will *emit*, so the source
 # it refers to has a TypeScript extension. Tried before the literal path.
 # Values are ordered; `.ts` before `.tsx` matches tsc.
+#
+# `.mjs` and `.cjs` rewrite to exactly one extension each, and narrowly: tsc
+# maps a module-kind-bearing specifier only onto the source that emits *that*
+# module kind, so `./x.mjs` means `x.mts` and never `x.ts`. Both were absent
+# until 2026-09-01 because `.mts`/`.cts` were not analyzed, so the targets they
+# name could not be nodes and the rewrite could only ever miss.
 _TS_ESM_REWRITES: Final[Mapping[str, tuple[str, ...]]] = {
     ".js": (".ts", ".tsx"),
     ".jsx": (".tsx",),
+    ".mjs": (".mts",),
+    ".cjs": (".cts",),
 }
 
 # A specifier is relative if it starts one of these ways, and no other way.
@@ -207,15 +225,24 @@ def resolve_imports(analysis: RepositoryAnalysis) -> tuple[ResolvedImport, ...]:
 
     Measured 2026-08-31: 3000 files by 334 unresolvable relative imports is
     1 002 000 imports and **76-79 s** here (~77 µs/import). An unresolved
-    relative specifier is the worst case by a wide margin — it tries all ~15
-    candidates before failing, ~65x the cost of a bare package specifier — and
-    it is also the cheapest string for an attacker to write.
+    relative specifier is the worst case by a wide margin — it exhausts every
+    candidate before failing, ~65x the cost of a bare package specifier — and it
+    is also the cheapest string for an attacker to write.
+
+    That measurement predates the 2026-09-01 `.mts`/`.cts` widening and is now
+    an **underestimate**, by inspection rather than by a re-run: `_candidates`
+    yields rewrites + 1 literal + ``EXTENSIONS`` + ``EXTENSIONS`` index forms,
+    so the worst case (an unresolvable ``./x.js``) went from 15 candidates to
+    19, and a bare ``./x`` from 13 to 17. Treat the figures below as a floor
+    roughly a quarter under the truth until someone re-measures.
 
     `analysis/pipeline.py` now stops parsing at ``MAX_IMPORTS`` (100 000), so
     the input to this function is bounded by construction: the same fixture
-    measures **7.7 s** under the shipped defaults. The number to keep in view is
-    therefore ``MAX_IMPORTS`` x the per-import cost above; anyone raising that
-    limit is spending time in *this* function, with no clock running to stop it.
+    measured **7.7 s** under the shipped defaults, on the same pre-widening
+    basis. The number to keep in view is ``MAX_IMPORTS`` x the per-import cost
+    above; anyone raising that limit — or adding an extension, which lengthens
+    every failing lookup — is spending time in *this* function, with no clock
+    running to stop it.
     Threading a `Deadline` through here was the alternative and was rejected —
     see ADR-019 for why a partial resolution is a worse output than a bounded
     one.
