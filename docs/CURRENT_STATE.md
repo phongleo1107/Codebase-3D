@@ -46,7 +46,7 @@ Two decisions inside that are worth carrying (full reasoning in ADR-023). **`MAX
 
 **The whole backend request path, end to end, and its tests.** `app/api/` now holds `routes.py`, `middleware.py`, and `app.py`, with `app/main.py` as the entry point; `app/analysis/` holds `deadline.py`, `parser.py`, `pipeline.py`, `resolver.py`, `descriptions.py`, `graph_builder.py`, `routes.py`, and `component_diagram.py` — the whole analysis half of the backend; and `app/security/` holds all four modules the MVP needs — the fifth (HMAC tokens) went out of scope with `/api/explain` (ADR-013). Missing from the routing layer, all Day 3: the rate limiter, the concurrency gate, and CORS.
 
-**Plus a frontend scaffold** that builds, typechecks under `strict` (with `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess`), and renders — against a fixture. It has **no tests of its own**; the backend's 1336 are still the whole suite.
+**Plus a frontend scaffold** that builds, typechecks under `strict` (with `exactOptionalPropertyTypes` and `noUncheckedIndexedAccess`), and renders — against a fixture. It has **no tests of its own**; the backend's 1431 are still the whole suite.
 
 | Path | Notes |
 |---|---|
