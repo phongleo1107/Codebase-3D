@@ -812,3 +812,66 @@ Accepted
 
 ### Status
 Accepted
+
+---
+
+## ADR-025 — The component diagram is adopted from an inert document behind an element allowlist, not injected as HTML
+
+### Decision
+
+`frontend/src/ui/ComponentDiagram.tsx` renders `AnalyzeResponse.componentDiagram` with **`mermaid` 11.17.2**, exact-pinned. Four things are decided here.
+
+**Mermaid is configured `securityLevel: 'strict'` and `htmlLabels: false`**, and both are security controls rather than styling. `htmlLabels` is set at the **top level**, not as `flowchart.htmlLabels`, which is deprecated at this version and logs a warning.
+
+**The SVG string is never injected as markup.** `mermaid.render()` returns a string, so something must turn it into nodes; that something is not `innerHTML` and not `dangerouslySetInnerHTML`. The string is parsed as `image/svg+xml` into an **inert** document, inspected there, and only then `importNode`d into the live one.
+
+**The inspection is an element allowlist and refuses rather than scrubs.** Fifteen elements are permitted — `circle defs feDropShadow filter g linearGradient marker path polygon rect stop style svg text tspan` — plus a denylist over the scriptable attribute classes (`on*`, `href`, `*:href`, `base`). Anything else, a failed XML parse, or a root that is not an `<svg>` in the SVG namespace blanks the panel and shows why.
+
+**A Mermaid parse failure reports a fixed message and never the exception.** Mermaid's parse errors quote the offending source line, and that line contains repository text.
+
+### Reason
+
+**On why this render needed a decision at all.** `GraphNode.description` and `ServiceEndpoint.summary` are strings that sit *beside* a format: React escapes them and the argument ends. `componentDiagram` is different in kind — [ADR-024](#adr-024--the-component-diagram-draws-containers-one-unnamed-external-system-and-routes-node-ids-are-synthetic) puts repository text *inside* Mermaid source, and the renderer hands back markup. Every other sink in the app is satisfied by "render it as a text node". This one cannot be, because by the time we hold it, it *is* markup.
+
+**On `htmlLabels: false` being the control.** With html labels on, Mermaid emits a `foreignObject` full of HTML and *widens* its own DOMPurify pass to preserve it (`ADD_TAGS: ['foreignobject']`, `HTML_INTEGRATION_POINTS: { foreignobject: true }`). Turning it off means a label is the text content of an SVG `<text>`/`<tspan>`, which has no markup parser — the same structural argument `scene/GraphCanvas.tsx` makes about painting Cytoscape labels to a `<canvas>`, and the same move ADR-024 makes about identifiers: remove the sink instead of filtering what flows into it.
+
+**On reading the renderer rather than trusting it.** Two things about Mermaid 11.17.2 are the opposite of what its reputation implies, and both were read out of the installed package and then confirmed in a browser:
+
+- `sanitizeText` looks like it escapes angle brackets. It does not, here. The half that does — `sanitizeMore` — is **gated on html labels being on**, so with them off it is a no-op. What runs unconditionally is `DOMPurify.sanitize(text, { FORBID_TAGS: ['style'] })`. **The protection is DOMPurify, not entity-escaping**, and a comment claiming otherwise would have been confidently wrong.
+- Mermaid's html-label output is **not well-formed XML** (a `foreignObject` carrying `<img src="x">` fails with "Opening and ending tag mismatch: img"). That is what makes the XML parse a *gate* rather than a formality: if `htmlLabels` is ever flipped back on, the panel goes blank and says so instead of quietly growing an HTML sink. The config mistake that matters is the one it fails on.
+
+**On why the safety cannot live in the injection call.** Both obvious options are unsafe for arbitrary markup, for reasons worth writing down because both are widely believed to be safe:
+
+- `innerHTML` runs the HTML fragment parser, which flags fragment-parsed `<script>` as already-started so it never executes — but it does **nothing** about `onload=` / `onbegin=` / `onerror=`, which fire normally. "innerHTML doesn't run scripts" is true and is not the property needed.
+- `DOMParser` + `importNode` is not automatically better: an SVG `<script>` created through the DOM **does** execute on insertion.
+
+So the safety has to come from *what* is injected, which is why the check exists and why it runs against an inert document — one with no browsing context, where nothing executes and no handler fires while it is being examined.
+
+**On refusing rather than scrubbing.** `api/limits.ts` already states the house preference: a valid thing rejected is loud, a thing silently altered is not. A scrubbed diagram is a picture that is subtly not the repository's; a refused one is a message.
+
+**On the allowlist being observed rather than designed.** The fifteen elements are the measured output for the golden fixture, for subgraphs and arrow labels, and for a diagram built entirely of hostile labels. A general-purpose SVG allowlist would have been longer and would have admitted things Mermaid never emits. The version is exact-pinned, so the set can only drift on a deliberate upgrade — at which point the panel refuses and names the element, which is the intended way to find out.
+
+**On the attribute rule being a denylist while the element rule is an allowlist.** The asymmetry is deliberate. The scriptable attribute space in SVG is small and well characterized; the decorative space is large and grows across patch releases. An attribute allowlist would blank the panel over a new `stroke-linejoin`.
+
+### Consequences
+
+- **`componentDiagram` has a sink**, and docs/SECURITY.md's "Repository comment rendered as HTML (XSS)" row gains the first control in that document **verified against an observed browser render** rather than by reading code. Hostile labels were driven through the real renderer: `<script>…</script>` is deleted, `<img src=x onerror=…>` survives only as literal characters in a `<text>` node, a `</text><script>` break-out disappears, and the emitted SVG carries no `<script`, no `on*=` and no `foreignObject`.
+- **All four refusal paths were driven, and each fired at its intended layer** — which is the part that makes the design testable rather than merely arguable. A `click c0 "javascript:…"` directive makes Mermaid emit an `<a>` (its href already dropped by Mermaid's own `sanitize-url`) and the element allowlist refuses it, so no anchor ever entered the live DOM; a `click c0 href "https://…"` directive emits `xlink:href` with the prefix undeclared, and the XML parse refuses it; malformed Mermaid and an unknown diagram type both surface as the fixed message.
+- **The row stays `Partial`, for a new reason.** The evidence is real and not repeatable: the verification was interactive and the frontend has **no test runner at all**. Automating it is now the highest-value frontend test, and it needs no backend.
+- **The frontend's dependency count is no longer small.** `mermaid` pulls 159 transitive packages, including a second copy of `cytoscape`. docs/SECURITY.md's "Compromised or unmaintained dependency" row is updated to say so rather than leave "kept deliberately small" standing as a claim it no longer supports. The trade was taken knowingly: hand-writing a Mermaid renderer is worse in every direction, and the mitigation is that the package's *output* is treated as untrusted markup, not that the package is trusted.
+- **`src/graph/fixture.ts`'s `componentDiagram` was rewritten** to the shape the generator actually emits — synthetic ids, `%%` header comments, `flowchart LR` — derived from the fixture's own numbers. The previous value used `src` / `api` / `lib` as node *identifiers*, which read as though directory names became syntax; they never do (ADR-024). It also gained a standing markup probe in a label, the diagram-shaped counterpart of the `<script>` already planted in a description.
+- **The panel is not wired into `App.tsx`.** This is the render, not the layout decision, and nothing imports it yet.
+- **One residual is recorded rather than closed.** `<style>` is on the allowlist, because Mermaid scopes its generated CSS with `#id` selectors and the panel is unreadable without it. CSS cannot execute script, so the residual is exfiltration via `url()` in a crafted stylesheet — unreachable from repository text (ADR-024 confines it to quoted labels) and closed by the planned CSP `default-src 'self'`.
+
+### Alternatives considered
+
+- **`dangerouslySetInnerHTML`, on the grounds that Mermaid already DOMPurifies its output.** It does, and the premise is true: `securityLevel` is not `loose`, so `render` runs the whole SVG through DOMPurify. Rejected because it makes the app's safety a property of a third-party version bump. CLAUDE.md asks for validation at every boundary, and the browser is a boundary we own.
+- **Plain `innerHTML` instead**, on the grounds that it neutralizes `<script>`. Rejected on the facts: it does not neutralize event-handler attributes, which is the actual SVG XSS primitive.
+- **Rendering into an iframe with `sandbox`.** Genuinely strong, and Mermaid even has a `securityLevel: 'sandbox'` that does it. Rejected for the MVP: the diagram has to size itself inside a flex panel and be legible at the app's theme, and an iframe makes both awkward — it needs postMessage height plumbing and its own stylesheet. Worth revisiting if the panel ever becomes interactive, which is when the trade flips.
+- **Scrubbing the offending nodes instead of refusing the document.** Rejected for `limits.ts`'s reason: silent alteration of a picture is indistinguishable from a correct picture.
+- **A full attribute allowlist alongside the element allowlist.** Rejected as brittle in the wrong direction — see the asymmetry argument above.
+- **Sanitizing the Mermaid *source* on arrival, in addition to the backend's `_label`.** Rejected as the wrong layer twice over: it re-implements a grammar we did not write (ADR-024's stated reason for not escaping), and it defends the input to a renderer whose *output* is the thing that reaches the DOM.
+- **Skipping the version check and pinning a recalled `mermaid` version.** Not a real option — CLAUDE.md forbids it — but worth recording that 11.17.2 was confirmed against the registry, and that `flowchart.htmlLabels` turned out to be deprecated at it, which a recalled config would have got wrong.
+
+### Status
+Accepted
