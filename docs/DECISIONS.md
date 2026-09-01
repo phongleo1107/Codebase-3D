@@ -904,3 +904,115 @@ It does **not** drive a real browser. Two SVG-metric stubs (`getComputedTextLeng
 
 ### Status
 Accepted
+
+---
+
+## ADR-026 — File-dominant rendering with fCoSE layout; compound directory boxes demoted to a color-tint grouping cue (amends ADR-022)
+
+### Decision
+
+Replace the `cose` layout with `cytoscape-fcose` in `frontend/src/scene/style.ts`. Stop rendering directory compound nodes as filled, bordered, padded boxes; keep `GraphNode.parent` flowing into Cytoscape's `data.parent` (unchanged wire contract, unchanged `elements.ts` drop-invariants) purely as a layout/grouping signal for fCoSE and a possible future collapse/expand feature, not as a dominant visual element. Directory membership is instead conveyed to the user via a per-file `background-color` tint keyed to its top-level path segment (`frontend/src/scene/directoryColors.ts`), with an HTML/CSS legend outside the canvas (`frontend/src/ui/Legend.tsx`) rather than in-canvas directory labels.
+
+### Reason
+
+Hands-on testing against `expressjs/express` (141 files, 41 directories, 153 real import edges — confirmed via a direct API call and DOM inspection, not assumed) showed nested compound boxes as deep as 5 levels, each padded 14px, consuming most of the canvas and reducing files to near-invisible dots at the center; directories dominated the visual, imports did not drive clustering, and canvas margins were mostly empty compound-box padding. The backend's dependency data was verified correct and rich — the defect was entirely in frontend rendering/layout choice, not analysis.
+
+Separately, the `cose` layout's replacement was always an open decision: `style.ts`'s own prior comment and `docs/ARCHITECTURE.md` both said the final pick among `cola`/`elk`/`dagre` was deferred pending "real repository-sized graphs to measure against, not a ten-node fixture" — that measurement had never happened before this. `cytoscape-fcose` is chosen over those alternatives because it treats compound nesting as a soft constraint rather than a dominant structural signal (so `parent` can still shape the layout without forcing deep nested boxes) and because it is built to scale into the thousands-of-nodes range this project's real ceiling requires (`MAX_NODES=6000`/`MAX_EDGES=20000`, `frontend/src/api/limits.ts` and `backend/app/config.py`), not just a 141-node demo repo.
+
+### Alternatives considered
+
+- **`cytoscape-cola`** — weaker compound-node handling than fCoSE and slower convergence at the node counts this project's ceiling requires.
+- **`cytoscape-elk`** — excellent for strictly layered/hierarchical diagrams, but import graphs are not DAGs (real codebases have import cycles); a layered algorithm would visually imply a hierarchy the data doesn't guarantee, reintroducing "structure dominates" through a different mechanism. Also the heaviest of the three — it bundles a full Java-derived layout engine port.
+- **`cytoscape-dagre`** — same rank-direction/tree assumption problem as `elk`.
+- **Keep compound boxes, just shrink padding/`nestingFactor`.** Tested informally; does not address the deeper problem that compound nesting itself — not merely its padding — is the wrong dominant visual signal for an import graph.
+- **Drop `parent` from `elements.ts` entirely**, since directories are no longer drawn. Rejected: it would block a future collapse/expand (PRD §7) for no benefit, since retaining `parent` costs nothing once directories aren't rendered as boxes, and fCoSE still uses it as a grouping signal.
+
+### Consequences
+
+- New dependency: `cytoscape-fcose@2.2.0` (peer-dep compatible with the pinned `cytoscape@3.34.2`, confirmed against the npm registry; pulls one small transitive, `cose-base@2.2.0`). `@types/cytoscape-fcose@2.2.5` added as a devDependency for the strict + `exactOptionalPropertyTypes` build; its `ready`/`stop` handler types disagree with cytoscape's own `BaseLayoutOptions` under that flag, absorbed with one explained cast at the `GRAPH_LAYOUT` export boundary in `style.ts` rather than at each call site.
+- ADR-022's "Cytoscape's compound nodes consume a `parent`-shaped hierarchy directly" is amended, not superseded: `parent` is still consumed directly by Cytoscape, but the *rendering* of that hierarchy as filled/bordered boxes is removed in favor of a color-tint-plus-legend cue. ADR-022's core decision (Cytoscape.js, 2D, client-side layout) is unaffected.
+- ADR-005 (external packages are not graph nodes) and ADR-006 (hierarchy on a `parent` field, edges are imports-only) are unaffected — this is a rendering-layer decision only; the wire contract does not change.
+- A real, separate bug was fixed alongside this change: `GraphCanvas.tsx`'s `ResizeObserver` callback called `cy.resize()` then `cy.fit()` synchronously against `container.clientWidth/clientHeight`, which could read a stale box mid-reflow — the observed symptom was a graph staying shrunk in its original bounding box after a later viewport resize, with nothing ever correcting it. Fixed by reading the observer entry's `contentRect` instead of re-querying the DOM, deferring the fit to `requestAnimationFrame`, and adding a bounded (2-attempt) re-check that compares `cy.width()/height()` against the observed size before giving up. This fix is independent of the layout engine choice and would have been needed regardless of which layout replaced `cose`.
+- Collapse/expand, search, and camera-focus-on-node (PRD §1/§7) remain unimplemented — out of scope for this change — but unblocked: `parent` data is still present and grouped by fCoSE, so none of the above closes off adding them later.
+- Directory compound nodes are still present in the Cytoscape element set (not deleted), styled with zero background opacity and zero border width, purely as a layout hook — no visual footprint, but available if collapse/expand needs them later.
+
+### Correction (2026-09-02) — the "no visual footprint" claim above was false in one state
+
+The consequence directly above held only while nothing was selected. `GraphCanvas.tsx`'s selection effect classed `node.closedNeighborhood().union(node.ancestors())` as `neighbor`, and `ancestors()` on a file node *is* its enclosing directory chain — so selecting any file put the `node.neighbor` class on its directory boxes. In a Cytoscape stylesheet the later rule wins for a shared property, and `node.neighbor` (`border-width: 2`, `overlay-opacity: 0.12`) sits **after** `node.directory` (`border-width: 0`, no overlay). The invisible compound boxes therefore came back on every selection as bordered, blue-washed rectangles spanning large parts of the canvas, and cleared again on deselect — reported as the selection highlight "glitching".
+
+Two changes, both kept, because they guarantee different things:
+
+- **`GraphCanvas.tsx`** no longer classes directory nodes at all. The `.union(node.ancestors())` is dropped and `selected`/`neighbor`/`context`/`faded` are scoped to `cy.elements().difference(cy.nodes('.directory'))`. The ancestors were only ever unioned in to keep a selection from fading the box it sits in — a box that this ADR stopped drawing, so the union had no remaining purpose.
+- **`style.ts`** appends a final `node.directory` rule zeroing `background-opacity`, `border-width`, and `overlay-opacity`. Being last, it wins over every state rule, so ADR-026's guarantee no longer depends on one call site's element-set arithmetic staying correct.
+
+Verified in a real browser against `expressjs/express` (141 files, 41 directories) by reading computed Cytoscape styles: across select-hub → select-other → select-hub-again → deselect, zero directory nodes carry a state class and zero have a non-zero border/overlay/background; forcing `neighbor` and `selected` onto a directory node by hand still yields all three at 0.
+
+Two unrelated fixes landed in the same pass and are recorded here rather than as their own ADR, since neither changes a decision:
+
+- **Opening camera.** `fit: true` framed the whole graph, which on a real repository puts the entry point off to one side at an unreadable zoom. The canvas now fits, and then — if that fit zoom is below a legibility floor (`INITIAL_ZOOM` in `style.ts`) — zooms to the floor and centers the highest-degree node, which on a real repository is the entry point.
+- **Stale hover.** `mouseout` is not guaranteed to fire for every `mouseover`, so a missed one left a node wearing the hover halo permanently. `hovered` is now a singleton and is cleared on the container's `pointerleave`.
+
+Layout spacing was also loosened (`idealEdgeLength`, `nodeRepulsion` up; `gravity` down) — tuning, not a decision. *(Superseded within the day by ADR-027, which measured that raising them further is counter-productive and settled on 90/8000.)*
+
+### Status
+Accepted (with the 2026-09-02 correction above)
+
+---
+
+## ADR-027 — A deterministic post-layout overlap separation pass, and non-interactive edges and directory boxes (amends ADR-026)
+
+### Decision
+
+Add `frontend/src/scene/overlap.ts`: a deterministic, run-once separation pass that runs between fCoSE settling and the camera being aimed, and moves leaf nodes apart until their *rendered footprints* — dot plus the label drawn to its right — no longer overlap. Stop treating fCoSE's force parameters as the anti-overlap mechanism; they are responsible for the graph's shape, and `separateOverlaps` is responsible for legibility. Make edges and directory compound nodes non-interactive (`events: 'no'`), and disable box selection.
+
+### Reason
+
+Three separate user-reported defects, all in the same interaction surface, none of which the previous ADR's tuning could fix:
+
+1. **Overlapping nodes.** fCoSE is a force-directed layout, not a constraint solver — `nodeRepulsion` makes overlap unlikely, never impossible, and its component packer places disconnected subgraphs by bounding box, so nodes from different components routinely land on top of each other. ADR-026's correction tried to fix this by raising the force constants. Measuring that against `expressjs/express` showed it made things *worse*: 12000/110 grew the bounding box from 3385x1726 to 4305x4465 — halving the zoom at which the graph fits — and still left 14 overlapping pairs, because a longer ideal edge scatters clusters into each other's space faster than repulsion clears them. Force tuning is the wrong instrument; separation is a constraint, so it wants a constraint solver.
+2. **A drag starting on an edge did nothing instead of panning.** Edges are hairlines at 12–35% opacity — invisible as pointer targets, but Cytoscape still routed the grab to them.
+3. **Dragging apparently-empty canvas moved a whole subtree.** A compound node's body is the entire box its children occupy, and dragging it drags every child. ADR-026 made those boxes invisible but left them interactive, so the graph had large regions where a drag silently rearranged the layout.
+
+### Alternatives considered
+
+- **Keep tuning fCoSE's forces.** Measured and rejected — see above. It also cannot address the packer, which is where the worst pile-ups come from.
+- **`cytoscape-layout-utilities` / a layout with built-in overlap removal.** A new dependency for one function, and it would still not know about the label geometry, which is the part that actually collides here — the dots are 9–20px and the labels run to 200px+.
+- **Separate the dots only, ignoring labels.** Measured: it converges better (1,254 vs 5,627 residual pairs on `astro`) but optimises the wrong thing. Colliding *labels* are what reads as crowding; two dots 20px apart with their names written through each other is the reported defect.
+- **Globally scale the layout until nothing overlaps.** Measured on `astro`: ~3x scaling reduces the residual to 959 pairs but sprawls the graph to 14,917 units. It trades a defect visible only when zoomed in for one that is inescapable at every zoom.
+- **Make edges non-interactive by `unselectify()`/`ungrabify()` instead of `events: 'no'`.** Those flags do not stop the renderer from treating the element as the pointer target, which is the actual problem.
+
+### Consequences
+
+- **No new dependency.** The pass is ~120 lines of plain geometry over Cytoscape's public position/dimension API.
+- **Determinism is preserved** (CLAUDE.md: the same commit produces byte-identical output). Nodes are visited in Cytoscape insertion order, which is the backend's sorted order (ADR-018); every displacement is a pure function of the two footprints; the exactly-coincident case is broken by node index via a golden-angle spiral, never by a random jitter. Note this is a property of the *pass*, not of the layout — fCoSE itself still runs with its default `randomize`, so successive loads of the same commit do not produce the same picture. That was already true before this ADR.
+- **It is a guarantee at small and mid sizes and a best effort in the thousands**, measured in a browser rather than asserted: `expressjs/express` (141 file nodes) goes to **0** overlapping pairs in ~10 ms; `withastro/astro` (2,953 file nodes, the largest repository the backend will accept — see below) goes from **171,600 to 5,627** in ~960 ms, a 97% reduction. The pass returns its residual and `GraphCanvas.tsx` logs the count — never a node id, which is a repository path.
+- **~1 s of blocked main thread at the top end.** Accepted for now: it happens once, after a 7 s analysis, before first paint. A stall detector (8 iterations without the summed overlap depth improving) stops the pass burning time on a residual it cannot reduce.
+- **Layout constants revert to 90/8000** (`idealEdgeLength`/`nodeRepulsion` per unit scale) — below ADR-026's correction, above the original 70/4500 — since preventing overlap is no longer their job.
+- **Edges can no longer be clicked, hovered, or selected.** Nothing consumed an edge interaction; selection has always been node-driven.
+- **Directory compound nodes are now inert in every sense** — invisible (ADR-026), unclassed by the selection effect and style-zeroed (ADR-026's correction), and now non-interactive and `ungrabify()`d. A future collapse/expand feature will have to re-enable interaction deliberately.
+- **`wheelSensitivity` 0.3 → 0.8.** Cytoscape logs a warning for any custom value; it did so at 0.3 too.
+- **First tests for a `scene/` module**: `overlap.test.ts`, 9 tests, bringing the frontend suite to 43. They caught three real defects that inspection had not — a float-equality fixed point where exactly-touching boxes reported a ~1e-15 overlap forever; a stall detector keyed to pair *count* that aborted healthy runs, since a pair being separated stays one pair until it is not; and the diffusion behaviour that motivated the spiral pre-scatter (a 1,000-node pile went from 29,805 residual pairs to 18). Two of the tests were also found to be **vacuous** and were fixed: constructing Cytoscape with `elements` and no `layout` runs the default **grid** layout, which discards the positions the test just set.
+- **A jsdom caveat worth recording**, since it will mislead the next person: a headless Cytoscape instance does not resolve a stylesheet. `node.width()` returns 1 whatever the style says and `numericStyle('font-size')` returns `undefined`. The tests therefore exercise the algorithm on uniform boxes and say nothing about whether the footprint matches what `style.ts` paints; the browser measurements above are what cover that.
+
+### Correction (2026-09-02, later the same day) — the layout never ran in a hidden tab, and `gravity` was tuned in the wrong direction
+
+Reported as "the distribution looks even worse now", with a screenshot showing a regular grid lattice of nodes and a diagonal smear. Two independent causes, and the more serious one was not a tuning problem at all.
+
+**1. In a hidden document, fCoSE never ran.** `GraphCanvas.tsx` started the initial layout *only* from its `ResizeObserver` callback — a deliberate choice (see the file comment: the container has no resolved height when the effect first runs). But **a hidden document is delivered no `ResizeObserver` callbacks at all**, including the initial one `observe()` normally queues. The realistic path into this is ordinary: paste a URL, switch tabs while the 7 s analysis runs, come back. The canvas mounts hidden, the observer never fires, fCoSE never runs — and what renders is Cytoscape's **default `grid` layout**, which is exactly the lattice in the screenshot. It does not self-correct on return, because the size has not changed and the observer has nothing to report.
+
+Confirmed directly rather than inferred: with `document.hidden === true` and a 368x767 container, a freshly attached `ResizeObserver` produced **zero** callbacks in 1.5 s, `requestAnimationFrame` did not fire within 1.2 s, and the rendered graph measured a bounding box of exactly `467x748` — *byte-identical across reloads and unchanged by flipping `randomize`*, which is what proved a deterministic grid was running instead of a randomized force layout.
+
+Fixed by not making the initial layout depend on any callback being delivered: if the container already has a box when the effect runs (the common case), lay out immediately and synchronously. The observer stays as the fallback for the genuinely-unsized case it was written for, and keeps ownership of later refits; `laidOut` makes whichever path arrives second a no-op. The overlap/camera step was also un-deferred from `requestAnimationFrame` for the same reason. Verified with `document.hidden === true`: 0 overlapping pairs, camera at the 0.55 floor, hub centred — and the same numbers when visible (core-area fraction 0.512 hidden vs 0.511 visible), which is the point.
+
+This also retires a claim made above: the `~90 -> 0` express figure in the pass's own header was measured in a visible window, so the pass was never broken — but in a hidden tab it had nothing to separate, because the grid layout it was handed does not overlap.
+
+**2. `gravity` was scaled in the wrong direction.** The original reasoning — ease it down so a large graph can "breathe outward" — sounds right and produced the worst layouts measured. Gravity is what stops a force layout drifting into a sparse, stringy sprawl. On `expressjs/express`, raising it from 0.265 to 0.6-0.9 lifted the core-area fraction from ~0.32 to ~0.43 and roughly halved the bounding-box area, with residual overlaps at zero. On `withastro/astro` gravity barely moves the bounding box but raising it *increases* residual overlaps (9,180 -> 14,088), since it compresses a graph already at the separation pass's limit. So it now scales *down* with node count from the opposite end of the range: `clamp(0.9 - nodeCount / 3000, 0.1, 0.9)`.
+
+**Two alternatives tested and rejected, both worse:**
+
+- **Drop compound nesting from the layout** (directories are invisible since ADR-026, so the containment looked like pure cost). On express it looked like a clear win — bounding box 4715x1949 to 1328x1246. On astro it was a disaster: core-area fraction 0.72 to 0.134, bounding box to 7722x7706, residual overlaps roughly tripled. Compound containment is doing real work at scale, and ADR-026's decision to keep `parent` stands.
+- **Flatten to top-level directories only**, matching the tint palette and legend. Also much worse on astro (core 0.123). Recorded because it is the obvious next idea after the one above.
+- **`randomize: false` for a stable picture across loads.** Does not mean "seed deterministically" — it means "start from the nodes' current positions", which on a freshly built graph is every node at (0, 0). fCoSE produces a partial layout from that degenerate seed and never emits `layoutstop`, silently disabling separation and the camera. Reverted to `true`; the run-to-run variance is documented in `style.ts` and left in place, since removing it properly means seeding real initial positions.
+
+### Status
+Accepted (with the two 2026-09-02 corrections above)

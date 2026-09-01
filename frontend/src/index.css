@@ -1,13 +1,15 @@
 @import 'tailwindcss';
 
 /* PRD §6: dark, minimal, high information density. The canvas palette is
-   duplicated as literals in src/scene/style.ts — Cytoscape paints to a
-   <canvas> and cannot resolve a CSS custom property. */
+   duplicated as literals in src/scene/style.ts and src/ui/App.tsx —
+   Cytoscape paints to a <canvas> and cannot resolve a CSS custom property.
+   This is the app-chrome shade (header/footer/aside); the graph canvas area
+   itself is a step lighter (`#161b22`) so nodes have more to read against. */
 html,
 body,
 #root {
   height: 100%;
-  background-color: #0b0d10;
+  background-color: #0d1117;
 }
 
 body {
