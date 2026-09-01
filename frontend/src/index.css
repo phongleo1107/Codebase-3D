@@ -1,0 +1,16 @@
+@import 'tailwindcss';
+
+/* PRD §6: dark, minimal, high information density. The canvas palette is
+   duplicated as literals in src/scene/style.ts — Cytoscape paints to a
+   <canvas> and cannot resolve a CSS custom property. */
+html,
+body,
+#root {
+  height: 100%;
+  background-color: #0b0d10;
+}
+
+body {
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+}
