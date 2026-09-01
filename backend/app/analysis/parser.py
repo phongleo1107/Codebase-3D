@@ -1,10 +1,20 @@
-"""Import extraction — the only place repository source code is parsed.
+"""Parsing — the only place repository source code is turned into a tree.
 
-`extract_imports` turns one file's bytes into ``(specifier, line)`` pairs. It
-does **not** resolve them: ``"./util"`` comes out exactly as written, and
-turning that into a file in the archive is the resolver's job. Specifiers are
-reported, never followed, and no repository code is ever executed
-(docs/SECURITY.md, "Repository code executed").
+Two entry points, and the split between them is the point of the module
+(ADR-021). `parse_source` turns one file's bytes into a `Tree`, applying every
+guard that stands between untrusted input and tree-sitter. `extract_imports`
+turns that tree into ``(specifier, line)`` pairs. They are separate because
+imports are no longer the only thing read off a tree: `analysis/routes.py`
+runs its own query over the same one, and a *second parse* for it would mean a
+second copy of all five guards — the size cap, the binary sniff, the BOM strip,
+the deadline checks, and the pathological-tree refusal. A security control with
+two implementations has two chances to be wrong, so there is one parse, one set
+of guards, and as many readers of the result as the analysis needs.
+
+`extract_imports` does **not** resolve what it finds: ``"./util"`` comes out
+exactly as written, and turning that into a file in the archive is the
+resolver's job. Specifiers are reported, never followed, and no repository code
+is ever executed (docs/SECURITY.md, "Repository code executed").
 
 Parsing is deterministic and AST-based rather than textual, which is what makes
 the negative cases in the test suite work: ``// import './x'``,
@@ -64,7 +74,7 @@ from functools import lru_cache
 from pathlib import PurePosixPath
 from typing import Final
 
-from tree_sitter import Language, Node, Parser, Query, QueryCursor
+from tree_sitter import Language, Node, Parser, Query, QueryCursor, Tree
 
 from app.analysis.deadline import Deadline
 from app.config import Settings, get_settings
@@ -118,34 +128,39 @@ def _compiled_query(language: Language) -> Query:
     return Query(language, IMPORT_QUERY)
 
 
-def extract_imports(
+def parse_source(
     source: bytes,
     path: PurePosixPath,
     language: Language,
     deadline: Deadline,
     settings: Settings | None = None,
-) -> Iterator[tuple[str, int]]:
-    """Yield ``(specifier, line)`` for every module reference in ``source``.
+) -> Tree | None:
+    """Parse one file, or return ``None`` if it must not be parsed.
 
-    ``line`` is 0-indexed, as tree-sitter reports it; the frontend adds one.
-    Specifiers are raw and unresolved. Order follows tree-sitter's match order,
-    which is grouped by query pattern rather than by position — deterministic,
-    but not document order.
+    **This is the seam** (ADR-021). Every guard that decides whether untrusted
+    bytes reach tree-sitter lives here and only here — the size cap, the binary
+    sniff, the BOM strip, the two deadline checks, and the pathological-tree
+    refusal — so a second consumer of the tree gets all five by construction
+    rather than by remembering to re-implement them. A returned `Tree` is one
+    that has already been judged safe to run a query over; ``None`` means the
+    file was skipped and a reason was logged.
 
-    ``path`` is used only for logging. ``language`` selects the grammar and is
-    the caller's choice: the TSX grammar is a superset covering ``.tsx .js
-    .jsx .mjs .cjs``, while ``.ts`` needs the TypeScript grammar, whose
-    ``<T>expr`` type assertion TSX would read as JSX.
+    ``language`` selects the grammar and is the caller's choice: the TSX
+    grammar is a superset covering ``.tsx .js .jsx .mjs .cjs``, while ``.ts``
+    needs the TypeScript grammar, whose ``<T>expr`` type assertion TSX would
+    read as JSX. It is recoverable from the result — ``tree.language`` is the
+    identical object, which is what lets `extract_imports` and
+    `analysis/routes.detect_routes` take a tree alone and still find their
+    compiled query in the cache.
 
-    Never raises for a bad file — a file it cannot handle simply yields
-    nothing. `AnalysisTimeoutError` is the deliberate exception: the budget
-    belongs to the run, not to this file, so it propagates.
+    ``path`` is used only for logging.
 
-    This is a generator, so the guards below run on first iteration rather
-    than at call time.
+    Never raises for a bad file. `AnalysisTimeoutError` is the deliberate
+    exception: the budget belongs to the run, not to this file, so it
+    propagates.
     """
     try:
-        yield from _collect(source, path, language, deadline, settings or get_settings())
+        return _parse(source, path, language, deadline, settings or get_settings())
     except AnalysisTimeoutError:
         # The run is over. Not this file's failure to report, and the one thing
         # here that must not be swallowed.
@@ -155,32 +170,34 @@ def extract_imports(
         # They are named because they say something different: the host ran out
         # of a resource, which is worth a louder level than a malformed file.
         logger.warning("parse abandoned, resource exhausted: %s", type(exc).__name__)
+        return None
     except Exception as exc:
         # The catch-all is the point of the module (docs/SECURITY.md, "Parser
         # crash or hang"). Only the exception *type* is logged: a tree-sitter
         # or codec message can quote the source bytes that caused it, and
         # repository content must never reach a log record.
         _skip(path, f"unexpected {type(exc).__name__}")
+        return None
 
 
-def _collect(
+def _parse(
     source: bytes,
     path: PurePosixPath,
     language: Language,
     deadline: Deadline,
     settings: Settings,
-) -> list[tuple[str, int]]:
-    """The real work. Returns a list so that a failure part-way yields nothing."""
+) -> Tree | None:
+    """The guards, then the parse. Returns the tree only if all of them pass."""
     if len(source) > settings.MAX_PARSE_BYTES:
         _skip(path, "file exceeds the parse size cap")
-        return []
+        return None
 
     # Binary files reach here because the archive reader yields every regular
     # file and extension is a claim, not evidence. Parsing one wastes the
     # budget and can only produce noise.
     if b"\x00" in source[:_BINARY_SNIFF_BYTES]:
         _skip(path, "binary file")
-        return []
+        return None
 
     source = source.removeprefix(_BOM)
 
@@ -193,21 +210,55 @@ def _collect(
     # into a test failure) and segfaults for a callback source.
     tree = Parser(language).parse(source)
 
-    root = tree.root_node
     # NOT `root.has_error`. A recoverable syntax error is normal and its
     # imports are still harvested — partial recovery is the whole reason for
     # using tree-sitter here. Only the shape that makes the query quadratic is
     # refused.
-    if _is_pathological(root, settings):
+    if _is_pathological(tree.root_node, settings):
         _skip(path, "parse tree is pathologically malformed")
-        return []
+        return None
 
     # Parsing is bounded but not free — ~3.1 s for the worst 1 MiB input
-    # measured. Re-checking here keeps that off the front of the query.
+    # measured. Re-checking here keeps that off the front of every query the
+    # caller is about to run.
     deadline.check()
 
+    return tree
+
+
+def extract_imports(tree: Tree, path: PurePosixPath) -> Iterator[tuple[str, int]]:
+    """Yield ``(specifier, line)`` for every module reference in ``tree``.
+
+    ``line`` is 0-indexed, as tree-sitter reports it; the frontend adds one.
+    Specifiers are raw and unresolved: ``"./util"`` comes out exactly as
+    written. Order follows tree-sitter's match order, which is grouped by query
+    pattern rather than by position — deterministic, but not document order.
+
+    ``tree`` must come from `parse_source`, which is what guarantees the query
+    below is not the quadratic case. ``path`` is used only for logging.
+
+    Never raises: a query that fails yields nothing, for the same reason a file
+    that cannot be parsed does. This is a generator, so that runs on first
+    iteration rather than at call time.
+    """
+    try:
+        yield from _imports(tree)
+    except AnalysisTimeoutError:
+        raise
+    except (RecursionError, MemoryError) as exc:
+        logger.warning("query abandoned, resource exhausted: %s", type(exc).__name__)
+    except Exception as exc:
+        _skip(path, f"unexpected {type(exc).__name__}")
+
+
+def _imports(tree: Tree) -> list[tuple[str, int]]:
+    """The real work. Returns a list so that a failure part-way yields nothing."""
     imports: list[tuple[str, int]] = []
-    for _pattern, captures in QueryCursor(_compiled_query(language)).matches(root):
+    # `tree.language` rather than a passed-in Language: it is the identical
+    # object the caller handed `parse_source`, so `_compiled_query` hits its
+    # cache. Rebuilding instead would cost ~8.8 ms a file — ~26 s of a 60 s
+    # budget at MAX_SOURCE_FILES.
+    for _pattern, captures in QueryCursor(_compiled_query(tree.language)).matches(tree.root_node):
         sources = captures.get("src")
         if not sources:
             # Defensive, and a known mutation survivor: every pattern in
@@ -223,7 +274,7 @@ def _collect(
         if callees is not None and (len(callees) != 1 or callees[0].text != _REQUIRE):
             continue
         for node in sources:
-            specifier = _specifier(node)
+            specifier = string_literal_text(node)
             if specifier is not None:
                 imports.append((specifier, node.start_point[0]))
     return imports
@@ -273,11 +324,19 @@ def _is_pathological(root: Node, settings: Settings) -> bool:
     return False
 
 
-def _specifier(node: Node) -> str | None:
+def string_literal_text(node: Node) -> str | None:
     """The text inside a string literal node, or None if it is not usable.
 
-    Returning None is always "skip this one import", never an error: an
-    unusable specifier could not have been resolved anyway.
+    Returning None is always "skip this one thing", never an error: an unusable
+    string could not have been resolved — or routed to — anyway.
+
+    Shared with `analysis/routes.py`, which asks the same question of a route
+    path that this module asks of a module specifier, and needs the same answer
+    for the same reasons: both become a value in an API response, both are
+    compared or displayed as an exact string, and neither has any use for a
+    literal that JS would have to unescape first. This is the string-literal
+    counterpart of `descriptions.normalize_comment` — the shared *primitive*,
+    where locating the node it applies to stays each caller's own job.
     """
     # The next three checks are redundant against the grammar as it stands, and
     # mutation testing confirms it: deleting any of them leaves the suite green.

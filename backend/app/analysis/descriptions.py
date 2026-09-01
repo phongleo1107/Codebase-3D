@@ -29,11 +29,11 @@ That argument is deliberately narrow, and it is the whole reason this module
 splits into a *locator* and a *normalizer*. The second consumer ADR-013
 promises — ``ServiceEndpoint.summary``, the comment above a route handler — is
 **not** at byte 0, and for it the argument reverses: a comment deep in a file
-can only be located unambiguously from the tree. So route detection, when it
-exists, will find that comment as a sibling node and hand its text to
-`normalize_comment`, which is the half that is genuinely shared. Locating is
-per-caller; normalizing is not. `header_description` is simply the locator for
-the byte-0 case.
+can only be located unambiguously from the tree. That caller now exists:
+`analysis/routes.py` finds the comment above a handler as a sibling node and
+hands its text to `normalize_comment`, which is the half that is genuinely
+shared (ADR-021). Locating is per-caller; normalizing is not.
+`header_description` is simply the locator for the byte-0 case.
 
 ## The normalization, and what each step is for
 
@@ -65,8 +65,9 @@ repository did not write.
 ## Two behaviours that look like bugs and are not
 
 **Undecodable bytes are replaced, not refused.** ``errors="replace"``, where
-`parser._specifier` uses strict decoding — and the difference is deliberate. A
-specifier must match an archive path byte-for-byte, so a U+FFFD there
+`parser.string_literal_text` uses strict decoding — and the difference is
+deliberate. A specifier must match an archive path byte-for-byte, and so must a
+route path, so a U+FFFD in either
 manufactures an edge that can never resolve; a description is displayed, not
 compared, so U+FFFD is an honest "this byte was not text" and costs nothing.
 There is also a case strict decoding gets actively wrong: the scan window below
@@ -76,9 +77,11 @@ description of that file because of where our window happened to fall.
 
 **`normalize_comment` refuses input that is not comment syntax**, returning
 ``None`` rather than passing the text through. It is not a general-purpose text
-sanitizer, and the future route-summary caller will be handing it a node it
-located from a tree; if that node is ever the wrong one, the failure should be
-an absent summary and not a line of source code in a response body.
+sanitizer, and `analysis/routes.py` hands it a node it located from a tree; if
+that node is ever the wrong one, the failure should be an absent summary and not
+a line of source code in a response body. That is not hypothetical — mutation
+testing removed route detection's own `comment` node-type check and this refusal
+is what still kept the statement text out of the response.
 """
 
 from typing import Final
@@ -130,13 +133,28 @@ def header_description(source: bytes, settings: Settings | None = None) -> str |
     return _normalize(_leading_comment(window.decode("utf-8", errors="replace")), settings)
 
 
-def normalize_comment(raw: bytes | None, settings: Settings | None = None) -> str | None:
+def normalize_comment(
+    raw: bytes | None,
+    settings: Settings | None = None,
+    *,
+    limit: int | None = None,
+) -> str | None:
     """Normalize one comment's own text — markers included — into a description.
 
-    The half of this module that is shared. `header_description` locates a
-    comment by scanning from byte 0; route detection will locate one from the
-    tree, as the sibling before a handler, and both then arrive here with the
-    same thing: the comment exactly as it appears in the file, ``/**`` and all.
+    The half of this module that is shared, and as of ADR-021 it has its second
+    caller. `header_description` locates a comment by scanning from byte 0;
+    `analysis/routes.py` locates one from the tree, as the sibling before a
+    handler, and both then arrive here with the same thing: the comment exactly
+    as it appears in the file, ``/**`` and all.
+
+    ``limit`` overrides ``MAX_DESCRIPTION_CHARS``, and exists because the two
+    callers land in different fields with different bounds —
+    ``GraphNode.description`` at 500 characters, ``ServiceEndpoint.summary`` at
+    300. It is a parameter rather than something the caller applies afterwards
+    so that ADR-020's guarantee survives: the cap is counted in *output*
+    characters while cleaning, which stops the work at the limit. Truncating a
+    500-character result down to 300 would give the same string here and would
+    quietly stop being equivalent the moment the two limits were reordered.
 
     ``None`` in, ``None`` out, so a caller that found no comment does not need a
     branch. ``None`` also comes back for text that is not a comment at all; see
@@ -144,17 +162,20 @@ def normalize_comment(raw: bytes | None, settings: Settings | None = None) -> st
     """
     if raw is None:
         return None
-    return _normalize(raw.decode("utf-8", errors="replace"), settings)
+    return _normalize(raw.decode("utf-8", errors="replace"), settings, limit)
 
 
-def _normalize(comment: str | None, settings: Settings | None) -> str | None:
+def _normalize(
+    comment: str | None, settings: Settings | None, limit: int | None = None
+) -> str | None:
     """Markers off, cleaned, bounded, empty-to-``None``. The whole pipeline."""
     if comment is None:
         return None
     body = _strip_markers(comment)
     if body is None:
         return None
-    limit = (settings if settings is not None else get_settings()).MAX_DESCRIPTION_CHARS
+    if limit is None:
+        limit = (settings if settings is not None else get_settings()).MAX_DESCRIPTION_CHARS
     # `.rstrip()` because the cleaner stops the moment it has `limit`
     # characters, and the character that took it there may be the space it
     # emitted before a word it never reached.

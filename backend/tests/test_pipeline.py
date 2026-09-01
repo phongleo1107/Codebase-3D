@@ -44,7 +44,7 @@ from pydantic import SecretStr
 
 from app.analysis import pipeline as pipeline_module
 from app.analysis.deadline import Deadline
-from app.analysis.parser import extract_imports
+from app.analysis.parser import parse_source
 from app.analysis.pipeline import (
     JAVASCRIPT,
     SKIP_FILTERED,
@@ -53,6 +53,7 @@ from app.analysis.pipeline import (
     RepositoryAnalysis,
     analyze_repository,
 )
+from app.analysis.routes import detect_routes
 from app.config import Settings
 from app.errors import (
     AnalysisTimeoutError,
@@ -448,23 +449,36 @@ def test_download_status_other_than_200_is_upstream_unavailable(
 
 
 def _spy_deadlines(monkeypatch: pytest.MonkeyPatch) -> list[Deadline]:
-    """Record the Deadline object each stage is handed."""
+    """Record the Deadline object each stage is handed.
+
+    Three stages take one as of ADR-021, not two: the archive reader, the parse,
+    and route detection. `extract_imports` is deliberately absent — it no longer
+    takes a deadline at all, because the check that used to sit in front of its
+    query moved into `parse_source`, where it guards every query run over the
+    tree rather than only that one.
+    """
     seen: list[Deadline] = []
     real_iter = iter_source_files
-    real_extract = extract_imports
+    real_parse = parse_source
+    real_detect = detect_routes
 
     def iter_spy(raw: Any, limits: Any, deadline: Deadline, info: Any = None) -> Any:
         seen.append(deadline)
         return real_iter(raw, limits, deadline, info)
 
-    def extract_spy(
+    def parse_spy(
         source: Any, path: Any, language: Any, deadline: Deadline, settings: Any = None
     ) -> Any:
         seen.append(deadline)
-        return real_extract(source, path, language, deadline, settings)
+        return real_parse(source, path, language, deadline, settings)
+
+    def detect_spy(tree: Any, path: Any, deadline: Deadline, settings: Any = None) -> Any:
+        seen.append(deadline)
+        return real_detect(tree, path, deadline, settings)
 
     monkeypatch.setattr(pipeline_module, "iter_source_files", iter_spy)
-    monkeypatch.setattr(pipeline_module, "extract_imports", extract_spy)
+    monkeypatch.setattr(pipeline_module, "parse_source", parse_spy)
+    monkeypatch.setattr(pipeline_module, "detect_routes", detect_spy)
     return seen
 
 
@@ -484,8 +498,8 @@ def test_exactly_one_deadline_is_constructed_and_shared(
 
     run(make_source_tar({"a.ts": b"1", "b.ts": b"2", "c.ts": b"3"}), client=client)
 
-    # One from the archive reader plus one per parsed file.
-    assert len(seen) == 4
+    # One from the archive reader, then a parse and a route detection per file.
+    assert len(seen) == 7
     assert len({id(deadline) for deadline in seen}) == 1
 
 
@@ -513,12 +527,18 @@ def test_deadline_stops_the_next_file_not_the_running_one(
 ) -> None:
     """ADR-010's consequence, pinned so nobody reads the deadline as preemption.
 
-    The clock is frozen until the first file finishes parsing, then jumps past
-    the budget. The first file is *not* interrupted — it completes and its
-    imports are extracted — and the run aborts on the *second* file. There is
-    no in-parse timeout in tree-sitter 0.26.0, so the granularity really is one
-    whole file; a hostile file can still hold this thread for a few seconds
-    after the budget is gone.
+    The clock is frozen until the first file is completely done with, then jumps
+    past the budget. The first file is *not* interrupted — it completes, its
+    imports are extracted and its routes detected — and the run aborts on the
+    *second* file. There is no in-parse timeout in tree-sitter 0.26.0, so the
+    granularity really is one whole file; a hostile file can still hold this
+    thread for a few seconds after the budget is gone.
+
+    The clock is advanced from a `detect_routes` spy because that is now the
+    last thing done to a file's tree (ADR-021). Advancing it from the import
+    spy instead would abort *inside* the first file, at route detection's own
+    deadline check, and would therefore stop testing what this test is named
+    for.
     """
     elapsed = {"jumped": False}
     # `app/analysis/deadline.py` does `import time` and calls `time.monotonic()`,
@@ -526,15 +546,15 @@ def test_deadline_stops_the_next_file_not_the_running_one(
     monkeypatch.setattr(time, "monotonic", lambda: 1000.0 if elapsed["jumped"] else 0.0)
 
     parsed: list[str] = []
-    real_extract = extract_imports
+    real_detect = detect_routes
 
-    def extract_spy(source: Any, path: Any, language: Any, deadline: Any, settings: Any) -> Any:
-        result = list(real_extract(source, path, language, deadline, settings))
+    def detect_spy(tree: Any, path: Any, deadline: Any, settings: Any = None) -> Any:
+        result = list(real_detect(tree, path, deadline, settings))
         parsed.append(str(path))
         elapsed["jumped"] = True
         return iter(result)
 
-    monkeypatch.setattr(pipeline_module, "extract_imports", extract_spy)
+    monkeypatch.setattr(pipeline_module, "detect_routes", detect_spy)
 
     with pytest.raises(AnalysisTimeoutError):
         run(
@@ -578,15 +598,21 @@ def test_secret_paths_never_reach_the_parser(
     The three paths here all have a supported extension, so an implementation
     that filtered *after* choosing a grammar would still have handed a vendored
     bundle and a file named `id_rsa.ts` to tree-sitter.
+
+    Spying on `parse_source` rather than on `extract_imports` makes this the
+    stronger claim it always meant to be: the filtered bytes never reach the
+    *parser*, so no consumer of the tree — imports, routes, or whatever is added
+    next — can see them either. Under the old arrangement a second reader could
+    have been added with its own parse and this test would have stayed green.
     """
     seen: list[str] = []
-    real_extract = extract_imports
+    real_parse = parse_source
 
-    def extract_spy(source: Any, path: Any, *args: Any) -> Any:
+    def parse_spy(source: Any, path: Any, *args: Any) -> Any:
         seen.append(str(path))
-        return real_extract(source, path, *args)
+        return real_parse(source, path, *args)
 
-    monkeypatch.setattr(pipeline_module, "extract_imports", extract_spy)
+    monkeypatch.setattr(pipeline_module, "parse_source", parse_spy)
 
     run(
         make_source_tar(
@@ -1333,4 +1359,172 @@ def test_no_description_reaches_the_logs(
         analysis = run(make_source_tar({"src/a.ts": content}), client=client)
 
     assert analysis.files[0].description == marker
+    assert marker not in caplog.text
+
+
+# --------------------------------------------------------------------------
+# Routes (ADR-021) — the second reader of the tree
+# --------------------------------------------------------------------------
+
+SERVER = b"""\
+const app = express();
+/** List every user. */
+app.get('/users', listUsers);
+app.post('/users', createUser);
+"""
+
+
+@respx.mock
+def test_routes_reach_the_analysis(client: httpx.Client) -> None:
+    """The join, for route detection: a tarball in, a service map out."""
+    analysis = run(make_source_tar({"src/server.ts": SERVER}), client=client)
+
+    assert [(e.method, e.path, e.file) for e in analysis.service_map] == [
+        ("GET", "/users", "src/server.ts"),
+        ("POST", "/users", "src/server.ts"),
+    ]
+    assert analysis.service_map[0].summary == "List every user."
+    assert analysis.service_map[1].summary is None
+    assert analysis.routes_truncated is False
+
+
+@respx.mock
+def test_the_service_map_spans_files_in_archive_order(client: httpx.Client) -> None:
+    """`service_map` flattens per-file routes, so its order is archive order —
+    which groups a file's endpoints together, the way a reader wants them."""
+    analysis = run(
+        make_source_tar(
+            {
+                "src/a.ts": b"app.get('/a', h);\n",
+                "src/b.ts": b"app.get('/b', h);\napp.post('/b', h);\n",
+            }
+        ),
+        client=client,
+    )
+
+    assert [e.path for e in analysis.service_map] == ["/a", "/b", "/b"]
+
+
+@respx.mock
+def test_a_file_with_no_routes_carries_none(client: httpx.Client) -> None:
+    """The ordinary case. Almost every file in a repository declares no route,
+    which is why the field defaults rather than being required."""
+    analysis = run(make_source_tar({"src/a.ts": b"export const a = 1;\n"}), client=client)
+
+    assert analysis.files[0].routes == ()
+    assert analysis.service_map == ()
+
+
+@respx.mock
+def test_a_secret_file_never_produces_a_route(client: httpx.Client) -> None:
+    """`is_secret_path` runs before the parse, so a filtered file has no tree
+    and therefore no routes — a property of the ordering, not a second check.
+
+    The companion of `test_a_secret_file_never_produces_a_description`. Both
+    now rest on the same fact: nothing filtered reaches `parse_source`.
+    """
+    analysis = run(
+        make_source_tar(
+            {
+                "node_modules/express/lib/app.js": b"app.get('/vendored', h);\n",
+                ".env.ts": b"app.get('/leaked', h);\n",
+                "src/app.ts": b"app.get('/real', h);\n",
+            }
+        ),
+        client=client,
+    )
+
+    assert [e.path for e in analysis.service_map] == ["/real"]
+
+
+@respx.mock
+def test_a_file_the_parser_gives_up_on_declares_no_routes(client: httpx.Client) -> None:
+    """No tree means no routes, and the file is still a node.
+
+    This is the coupling ADR-020 deliberately avoided for descriptions and
+    deliberately accepts here: a description is at byte 0 and needs no parse, a
+    route can only be located in a tree. So a binary file keeps its description
+    and loses its routes, which is the honest outcome for both.
+    """
+    binary = b"\x00\x01\x02" + b"app.get('/x', h);\n"
+
+    analysis = run(make_source_tar({"src/blob.ts": binary}), client=client)
+
+    assert paths(analysis) == ["src/blob.ts"]
+    assert analysis.files[0].routes == ()
+    assert analysis.files[0].size_bytes == len(binary)
+
+
+@respx.mock
+def test_the_endpoint_cap_stops_collection_without_truncating_the_analysis(
+    client: httpx.Client,
+) -> None:
+    """`MAX_SERVICE_ENDPOINTS` is not `MAX_IMPORTS` (ADR-021).
+
+    Both cap a running total, but the import cap abandons the download and sets
+    `truncated`, because resolution downstream has no clock. This one only stops
+    adding to the service map: the graph is unaffected and still complete, so
+    reporting the whole analysis as truncated would overstate what was lost.
+    Every file is still analyzed and every import still collected.
+    """
+    settings = Settings(MAX_SERVICE_ENDPOINTS=2)
+    content = b"import './x';\napp.get('/a', h);\napp.get('/b', h);\napp.get('/c', h);\n"
+
+    analysis = run(
+        make_source_tar({"src/a.ts": content, "src/b.ts": content}),
+        client=client,
+        settings=settings,
+    )
+
+    assert len(analysis.service_map) == 2
+    assert analysis.routes_truncated is True
+    # The cap fired, and yet nothing else was cut short.
+    assert analysis.truncated is False
+    assert analysis.imports_truncated is False
+    assert paths(analysis) == ["src/a.ts", "src/b.ts"]
+    assert analysis.import_count == 2
+
+
+@respx.mock
+def test_the_endpoint_cap_is_counted_across_files_not_per_file(
+    client: httpx.Client,
+) -> None:
+    """One file can declare tens of thousands of routes, so the budget is a
+    running total — the same shape as `MAX_IMPORTS` and for the same reason."""
+    settings = Settings(MAX_SERVICE_ENDPOINTS=3)
+    two = b"app.get('/a', h);\napp.post('/b', h);\n"
+
+    analysis = run(
+        make_source_tar({"src/a.ts": two, "src/b.ts": two}), client=client, settings=settings
+    )
+
+    assert len(analysis.service_map) == 3
+    assert analysis.routes_truncated is True
+
+
+@respx.mock
+def test_a_capped_service_map_still_builds_a_response(client: httpx.Client) -> None:
+    """The cap is the wire model's own bound, so hitting it here means
+    `AnalyzeResponse` validation can never be what fails a request."""
+    settings = Settings(MAX_SERVICE_ENDPOINTS=2)
+    content = b"app.get('/a', h);\napp.get('/b', h);\napp.get('/c', h);\n"
+
+    analysis = run(make_source_tar({"src/a.ts": content}), client=client, settings=settings)
+
+    assert len(list(analysis.service_map)) <= settings.MAX_SERVICE_ENDPOINTS
+
+
+@respx.mock
+def test_no_route_path_reaches_the_logs(
+    client: httpx.Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A route path is repository-authored input, like a specifier and a
+    description before it."""
+    marker = "zzmarkerroutezz"
+    content = f"app.get('/{marker}', h);\n".encode()
+
+    with caplog.at_level(logging.DEBUG):
+        analysis = run(make_source_tar({"src/a.ts": content}), client=client)
+
+    assert analysis.service_map[0].path == f"/{marker}"
     assert marker not in caplog.text

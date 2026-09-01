@@ -132,7 +132,7 @@ _RELATIVE_EXACT: Final = frozenset({".", ".."})
 #   "#"  a package-internal subpath import, resolved through `package.json`
 #        `"imports"` — config work, deferred with the rest of it.
 #
-# Backslash-prefixed Windows spellings need no entry: `parser._specifier`
+# Backslash-prefixed Windows spellings need no entry: `string_literal_text`
 # refuses any specifier containing a backslash outright, so none reaches here.
 _NOT_PACKAGE_SHAPED: Final = frozenset({".", "/", "#"})
 
@@ -252,7 +252,7 @@ def _resolve_one(
             return ResolvedImport(source, specifier, ref.line, Resolution.RESOLVED, target)
         return ResolvedImport(source, specifier, ref.line, Resolution.UNRESOLVED, None)
 
-    # Empty is unreachable — `parser._specifier` refuses an empty string body —
+    # Empty is unreachable — `parser.string_literal_text` refuses an empty body —
     # but `specifier[0]` below is not total without it, and a resolver that
     # crashes on an unexpected input is worse than one that counts it.
     if not specifier or specifier[0] in _NOT_PACKAGE_SHAPED:

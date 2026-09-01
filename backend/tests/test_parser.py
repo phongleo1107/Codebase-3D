@@ -27,7 +27,7 @@ from tree_sitter import Language
 
 from app.analysis import parser as parser_module
 from app.analysis.deadline import Deadline
-from app.analysis.parser import IMPORT_QUERY, extract_imports
+from app.analysis.parser import IMPORT_QUERY, extract_imports, parse_source
 from app.config import Settings
 from app.errors import AnalysisTimeoutError
 
@@ -51,17 +51,25 @@ def parse(
     deadline: Deadline | None = None,
     settings: Settings = SETTINGS,
 ) -> list[tuple[str, int]]:
-    """Run the extractor to completion and sort, so tests do not depend on
-    tree-sitter's pattern-grouped match order."""
-    return sorted(
-        extract_imports(
-            source,
-            PATH,
-            language,
-            deadline if deadline is not None else Deadline.after(60),
-            settings,
-        )
+    """Run the parse and the import query to completion and sort, so tests do
+    not depend on tree-sitter's pattern-grouped match order.
+
+    The two halves are separate functions as of ADR-021 — `parse_source` owns
+    every guard, `extract_imports` owns the query — and this helper composes
+    them exactly as `analysis/pipeline.py` does. A file the guards refuse yields
+    no tree and therefore no imports, which is the same observable behaviour the
+    single function had, so the tests below are unchanged.
+    """
+    tree = parse_source(
+        source,
+        PATH,
+        language,
+        deadline if deadline is not None else Deadline.after(60),
+        settings,
     )
+    if tree is None:
+        return []
+    return sorted(extract_imports(tree, PATH))
 
 
 def specifiers(source: bytes, **kwargs: object) -> list[str]:
@@ -496,7 +504,7 @@ def test_deadline_expiring_is_not_reported_as_a_skipped_file() -> None:
     """Guards against the catch-all swallowing AnalysisTimeoutError, which
     would turn an aborted run into a silently empty graph."""
     with pytest.raises(AnalysisTimeoutError):
-        list(extract_imports(b'import a from "./a";', PATH, TSX, Deadline.after(-1)))
+        parse_source(b'import a from "./a";', PATH, TSX, Deadline.after(-1))
 
 
 def test_live_deadline_completes_normally() -> None:
@@ -544,9 +552,14 @@ def test_deadline_is_checked_again_after_parsing() -> None:
     Parsing is bounded but not free, so a file can arrive under budget and
     leave over it. Without the second check the query runs anyway, on a
     deadline that has already passed.
+
+    The check lives in `parse_source` rather than in `extract_imports` as of
+    ADR-021, and that placement is the point: it now guards *every* query the
+    caller is about to run over the tree, so route detection inherits it
+    instead of needing its own copy.
     """
     with pytest.raises(AnalysisTimeoutError):
-        list(extract_imports(b'import a from "./a";', PATH, TSX, _SpentByParsing(), SETTINGS))
+        parse_source(b'import a from "./a";', PATH, TSX, _SpentByParsing(), SETTINGS)
 
 
 def test_deadline_is_checked_before_the_size_guard_rejects_nothing() -> None:
@@ -561,17 +574,26 @@ def test_deadline_is_checked_before_the_size_guard_rejects_nothing() -> None:
 # --------------------------------------------------------------------------
 
 
-def test_extraction_is_lazy() -> None:
-    """A generator, so nothing happens until the caller iterates.
+def test_the_guards_run_eagerly() -> None:
+    """`parse_source` is an ordinary function, so its guards fire at call time.
 
-    Pinned because the guards read as if they run at call time: an expired
-    deadline is not noticed until the first `next()`. A caller that builds a
-    generator per file up front and iterates later would get all its timeouts
-    at the wrong moment.
+    This is the footgun ADR-021 removed rather than a property it added. When
+    the guards lived inside a generator, an expired deadline went unnoticed
+    until the first `next()`, so a caller that built one generator per file up
+    front and iterated later got all of its timeouts at the wrong moment. There
+    is nothing to iterate now — the raise happens on the call.
     """
-    generator = extract_imports(b'import a from "./a";', PATH, TSX, Deadline.after(-1))
     with pytest.raises(AnalysisTimeoutError):
-        next(generator)
+        parse_source(b'import a from "./a";', PATH, TSX, Deadline.after(-1))
+
+
+def test_import_extraction_is_lazy() -> None:
+    """The query half is still a generator, so a caller that never iterates
+    never pays for the traversal."""
+    tree = parse_source(b'import a from "./a";', PATH, TSX, Deadline.after(60))
+    assert tree is not None
+    generator = extract_imports(tree, PATH)
+    assert next(generator) == ("./a", 0)
 
 
 def test_repeated_extraction_is_deterministic() -> None:

@@ -16,7 +16,9 @@ The sequence, and who owns each step::
       -> Client.send(..., stream=True)      *this module* — the first send
       -> fetch.archive.iter_source_files    wire bytes -> (path, content)
       -> security.secret_filter             drop what must never be a node
-      -> analysis.parser.extract_imports    (path, content) -> specifiers
+      -> analysis.parser.parse_source       content -> one guarded tree
+         |-> analysis.parser.extract_imports    tree -> specifiers
+         `-> analysis.routes.detect_routes      tree -> ServiceEndpoints
       -> analysis.descriptions              content -> the file's header comment
       -> RepositoryAnalysis                 the graph builder's input
 
@@ -97,7 +99,8 @@ from tree_sitter import Language
 
 from app.analysis.deadline import Deadline
 from app.analysis.descriptions import header_description
-from app.analysis.parser import extract_imports
+from app.analysis.parser import extract_imports, parse_source
+from app.analysis.routes import detect_routes
 from app.config import Settings, get_settings
 from app.errors import NoSupportedFilesError, RepositoryNotFoundError, UpstreamUnavailableError
 from app.fetch.archive import ArchiveInfo, Limits, iter_source_files
@@ -107,6 +110,7 @@ from app.fetch.github import (
     get_download_url,
     get_repo_metadata,
 )
+from app.models.api import ServiceEndpoint
 from app.security.secret_filter import is_secret_path
 from app.security.url_validation import RepoRef
 
@@ -197,6 +201,13 @@ class SourceFile:
     loc: int
     imports: tuple[ImportRef, ...]
     description: str | None = None
+    # The HTTP routes this file declares, already in wire form (ADR-021).
+    # Bounded twice over: `MAX_SERVICE_ENDPOINTS` caps how many exist across
+    # the whole analysis, and each one's path and summary are length-checked
+    # before the record is built, so this field does not weaken ADR-016's
+    # "nothing here scales with the size of a file" any more than `description`
+    # does. Empty for almost every file, which is why it defaults.
+    routes: tuple[ServiceEndpoint, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +247,13 @@ class RepositoryAnalysis:
     skipped: Mapping[str, int]
     truncated: bool
     imports_truncated: bool
+    # Set when `MAX_SERVICE_ENDPOINTS` stopped route collection. Deliberately
+    # does **not** also set ``truncated``, unlike the other two caps: those stop
+    # the run — they abandon the generator and therefore the download — while
+    # this one only stops adding to the service map. The graph is unaffected and
+    # still complete, so reporting the whole analysis as truncated would
+    # overstate what was lost (ADR-021).
+    routes_truncated: bool = False
 
     @property
     def skipped_files(self) -> int:
@@ -250,6 +268,18 @@ class RepositoryAnalysis:
         `analysis/resolver.resolve_imports` will return.
         """
         return sum(len(f.imports) for f in self.files)
+
+    @property
+    def service_map(self) -> tuple[ServiceEndpoint, ...]:
+        """Every detected route, in file order — ``AnalyzeResponse.serviceMap``.
+
+        Derived rather than stored, for `import_count`'s reason: it cannot drift
+        from ``files``. File order is archive order, which is deterministic for
+        a given commit; the graph builder sorts *nodes* because a graph has no
+        inherent order, but a service map reads better grouped by the file that
+        declares it, and grouping is what archive order already gives.
+        """
+        return tuple(endpoint for f in self.files for endpoint in f.routes)
 
 
 @contextmanager
@@ -364,7 +394,7 @@ def analyze_repository(
             # documents that a caller stopping early should close it, so the
             # only caller in the project ought to be the reference for that.
             with closing(members):
-                files, skipped, truncated, imports_truncated = _analyze(
+                files, skipped, truncated, imports_truncated, routes_truncated = _analyze(
                     members, deadline, settings
                 )
 
@@ -377,13 +407,16 @@ def analyze_repository(
         raise NoSupportedFilesError()
 
     logger.info(
-        "analysis complete: %d files, %d imports, %d skipped (%s), truncated=%s imports=%s",
+        "analysis complete: %d files, %d imports, %d routes, %d skipped (%s), "
+        "truncated=%s imports=%s routes=%s",
         len(files),
         sum(len(f.imports) for f in files),
+        sum(len(f.routes) for f in files),
         sum(skipped.values()),
         dict(sorted(skipped.items())),
         truncated,
         imports_truncated,
+        routes_truncated,
     )
     return RepositoryAnalysis(
         owner=metadata.owner,
@@ -394,6 +427,7 @@ def analyze_repository(
         skipped=dict(skipped),
         truncated=truncated,
         imports_truncated=imports_truncated,
+        routes_truncated=routes_truncated,
     )
 
 
@@ -401,7 +435,7 @@ def _analyze(
     members: Iterator[tuple[PurePosixPath, bytes]],
     deadline: Deadline,
     settings: Settings,
-) -> tuple[list[SourceFile], Counter[str], bool, bool]:
+) -> tuple[list[SourceFile], Counter[str], bool, bool, bool]:
     """Filter, classify, and parse each member. Returns files, skips, two flags.
 
     The loop body is deliberately the only place a file is judged: the archive
@@ -412,12 +446,18 @@ def _analyze(
     on the running import total (ADR-019). Both set ``truncated``; the second
     additionally sets ``imports_truncated``, so a consumer can tell a short file
     list from a short import list.
+
+    A third, ``MAX_SERVICE_ENDPOINTS``, does **not** stop it: it stops route
+    collection and sets ``routes_truncated`` alone, because the graph is still
+    complete when it fires (ADR-021).
     """
     files: list[SourceFile] = []
     skipped: Counter[str] = Counter()
     truncated = False
     imports_truncated = False
+    routes_truncated = False
     import_count = 0
+    route_count = 0
 
     for path, content in members:
         # First, before anything looks at the extension or spends a parse on
@@ -454,6 +494,17 @@ def _analyze(
             break
 
         language, label = grammar
+
+        # One parse, two readers (ADR-021). Every guard that decides whether
+        # these bytes reach tree-sitter lives in `parse_source`, so route
+        # detection inherits all of them instead of re-implementing them, and
+        # a hostile file costs one parse rather than two. `None` means the file
+        # was refused — oversized, binary, or pathologically malformed — and it
+        # still becomes a node with real bytes and lines and nothing read off
+        # it, which is the pre-existing behaviour for imports and is now the
+        # behaviour for routes too.
+        tree = parse_source(content, path, language, deadline, settings)
+
         # Specifiers are not resolved, here or anywhere in this module.
         #
         # Counted one at a time rather than per file, because a single 1 MiB
@@ -465,12 +516,26 @@ def _analyze(
         # node that other files legitimately import. `imports_truncated` is what
         # says the list is short.
         imports: list[ImportRef] = []
-        for specifier, line in extract_imports(content, path, language, deadline, settings):
-            if import_count >= settings.MAX_IMPORTS:
-                truncated = imports_truncated = True
-                break
-            imports.append(ImportRef(specifier, line))
-            import_count += 1
+        routes: list[ServiceEndpoint] = []
+        if tree is not None:
+            for specifier, line in extract_imports(tree, path):
+                if import_count >= settings.MAX_IMPORTS:
+                    truncated = imports_truncated = True
+                    break
+                imports.append(ImportRef(specifier, line))
+                import_count += 1
+
+            # Capped on the same running-total principle and for the same
+            # reason — one file can declare tens of thousands of routes — but
+            # against `MAX_SERVICE_ENDPOINTS`, which is the bound
+            # `models/api.AnalyzeResponse` already enforces at the wire. Hitting
+            # it here means that model check can never be what fails a request.
+            for endpoint in detect_routes(tree, path, deadline, settings):
+                if route_count >= settings.MAX_SERVICE_ENDPOINTS:
+                    routes_truncated = True
+                    break
+                routes.append(endpoint)
+                route_count += 1
 
         files.append(
             SourceFile(
@@ -486,6 +551,7 @@ def _analyze(
                 # cannot produce one — a property of this ordering, not of a
                 # second check (docs/SECURITY.md).
                 description=header_description(content, settings),
+                routes=tuple(routes),
             )
         )
 
@@ -499,7 +565,7 @@ def _analyze(
             logger.info("import cap reached: %d", settings.MAX_IMPORTS)
             break
 
-    return files, skipped, truncated, imports_truncated
+    return files, skipped, truncated, imports_truncated, routes_truncated
 
 
 def _line_count(content: bytes) -> int:
