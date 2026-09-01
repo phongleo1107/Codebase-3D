@@ -1,0 +1,111 @@
+{
+  "repository": {
+    "owner": "acme",
+    "name": "widgets",
+    "commitSha": "a1b2c3d"
+  },
+  "nodes": [
+    {
+      "id": ".",
+      "name": "widgets",
+      "path": ".",
+      "type": "directory",
+      "parent": null,
+      "depth": 0,
+      "language": null,
+      "description": null,
+      "bytes": null,
+      "loc": null,
+      "imports": null,
+      "importedBy": null,
+      "externalImports": null,
+      "unresolvedImports": null,
+      "sourceToken": null,
+      "fileCount": 2,
+      "totalBytes": 191
+    },
+    {
+      "id": "src",
+      "name": "src",
+      "path": "src",
+      "type": "directory",
+      "parent": ".",
+      "depth": 1,
+      "language": null,
+      "description": null,
+      "bytes": null,
+      "loc": null,
+      "imports": null,
+      "importedBy": null,
+      "externalImports": null,
+      "unresolvedImports": null,
+      "sourceToken": null,
+      "fileCount": 2,
+      "totalBytes": 191
+    },
+    {
+      "id": "src/a.ts",
+      "name": "a.ts",
+      "path": "src/a.ts",
+      "type": "file",
+      "parent": "src",
+      "depth": 2,
+      "language": "typescript",
+      "description": null,
+      "bytes": 20,
+      "loc": 1,
+      "imports": 0,
+      "importedBy": 1,
+      "externalImports": 0,
+      "unresolvedImports": 0,
+      "sourceToken": null,
+      "fileCount": null,
+      "totalBytes": null
+    },
+    {
+      "id": "src/index.ts",
+      "name": "index.ts",
+      "path": "src/index.ts",
+      "type": "file",
+      "parent": "src",
+      "depth": 2,
+      "language": "typescript",
+      "description": "The entry point.",
+      "bytes": 171,
+      "loc": 6,
+      "imports": 1,
+      "importedBy": 0,
+      "externalImports": 1,
+      "unresolvedImports": 0,
+      "sourceToken": null,
+      "fileCount": null,
+      "totalBytes": null
+    }
+  ],
+  "edges": [
+    {
+      "source": "src/index.ts",
+      "target": "src/a.ts",
+      "relationship": "imports"
+    }
+  ],
+  "stats": {
+    "files": 2,
+    "directories": 2,
+    "dependencies": 1,
+    "externalImports": 1,
+    "unresolvedImports": 0,
+    "skippedFiles": 2,
+    "truncated": false
+  },
+  "serviceMap": [
+    {
+      "method": "GET",
+      "path": "/healthz",
+      "file": "src/index.ts",
+      "line": 5,
+      "summary": "Health probe."
+    }
+  ],
+  "componentDiagram": "%% Component diagram, generated from the dependency graph (ADR-013).\n%% Containers are top-level directories; arrows are import counts.\nflowchart LR\n  subgraph repo[\"widgets\"]\n    c0[\"src · 2 files\"]\n  end\n  subgraph api[\"API surface\"]\n    r0[\"GET /healthz - Health probe.\"]\n  end\n  ext[\"External packages · 1 import\"]\n  r0 --> c0\n  c0 -->|1| ext"
+}

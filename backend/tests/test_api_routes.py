@@ -34,10 +34,12 @@ naming a parent that is not there. A naive slice of the builder's output passes
 none of them (ADR-018, ADR-023).
 """
 
+import json
 import logging
 import re
 import socket
 from collections.abc import AsyncIterator, Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -344,6 +346,53 @@ async def test_the_component_diagram_describes_the_capped_graph(
     for line in body["componentDiagram"].splitlines():
         if (label := re.search(r'^\s+c\d+\["([^"]+)"', line)) is not None:
             assert label.group(1).split(" ")[0] in top_level
+
+
+# --------------------------------------------------------------------------
+# The golden file
+# --------------------------------------------------------------------------
+
+GOLDEN_RESPONSE = Path(__file__).parent / "fixtures" / "analyze_response_golden.json"
+
+
+@respx.mock
+async def test_the_whole_response_matches_the_golden_file(client: httpx.AsyncClient) -> None:
+    """One repository, one file on disk, byte for byte.
+
+    ADR-013 made the whole `/api/analyze` response a pure function of the
+    commit; this is the first place that claim is cashed as a fixture on disk
+    rather than argued about. Every field-level test above checks one rule —
+    this one checks that the rules compose into exactly the response a client
+    receives.
+    """
+    serve(make_source_tar(REALISTIC))
+
+    response = await client.post(ANALYZE, json={"repository_url": SUBMITTED_URL})
+
+    assert response.status_code == 200
+    rendered = json.dumps(response.json(), indent=2, ensure_ascii=False) + "\n"
+    assert rendered == GOLDEN_RESPONSE.read_text(encoding="utf-8")
+
+
+@respx.mock
+async def test_the_same_commit_produces_byte_identical_json(client: httpx.AsyncClient) -> None:
+    """The other half of ADR-013's claim: not just golden, but repeatable.
+
+    Nothing in the suite had pinned this before — the golden-file test above
+    only says the response matches a fixture captured once. This calls the
+    real endpoint twice against the same mocked repository and asserts the
+    two response bodies are identical, catching anything nondeterministic
+    (unstable ordering, an uncontrolled clock or id) that a single capture
+    could not.
+    """
+    serve(make_source_tar(REALISTIC))
+    first = await client.post(ANALYZE, json={"repository_url": SUBMITTED_URL})
+
+    serve(make_source_tar(REALISTIC))
+    second = await client.post(ANALYZE, json={"repository_url": SUBMITTED_URL})
+
+    assert first.status_code == second.status_code == 200
+    assert first.text == second.text
 
 
 @respx.mock
