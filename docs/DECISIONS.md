@@ -799,7 +799,7 @@ Accepted
 - **`None` is a normal return**, for a graph with no file nodes and for a character limit too small to hold one container. `AnalyzeResponse.componentDiagram` is optional for exactly this.
 - **Ordering inside the output is a priority, not a layout.** Containers are written before routes so that a short budget spends itself on the thing ADR-013 names first; in an `LR` flowchart it is the arrows that place a box, so the picture is unaffected.
 - Like `resolver.py` and `graph_builder.py`, the module is pure and has **no logger**, both pinned by test.
-- **It has no caller.** The router is the first, and this is the third module in a row to ship in that position.
+- **It shipped with no caller**, the third module in a row to do so. *(**Joined 2026-09-01**, the same day: `app/api/routes.py` calls it on `build_graph`'s capped output. The cap matters — a diagram built from the uncapped `RepositoryAnalysis` would name containers holding no node the client received.)*
 
 ### Alternatives considered
 

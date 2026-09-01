@@ -35,6 +35,7 @@ none of them (ADR-018, ADR-023).
 """
 
 import logging
+import re
 import socket
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
@@ -304,18 +305,45 @@ async def test_the_secret_file_reaches_no_part_of_the_response(
 
 
 @respx.mock
-async def test_the_component_diagram_is_absent_until_its_generator_exists(
+async def test_the_response_carries_a_component_diagram(
     client: httpx.AsyncClient,
 ) -> None:
-    """Absent, and a valid response regardless — the field defaults (ADR-013).
+    """The generator landed, so the field is populated (ADR-013, ADR-024).
 
-    Flip this test when `app/analysis/component_diagram.py` lands.
+    Shape only — `tests/test_component_diagram.py` owns the content, including
+    the golden file. What this pins is that the router actually calls it.
     """
     serve(make_source_tar(REALISTIC))
 
     response = await client.post(ANALYZE, json={"repository_url": SUBMITTED_URL})
+    diagram = response.json()["componentDiagram"]
 
-    assert response.json()["componentDiagram"] is None
+    assert diagram is not None
+    assert diagram.startswith("%%")
+    assert "flowchart LR" in diagram
+
+
+@respx.mock
+async def test_the_component_diagram_describes_the_capped_graph(
+    client: httpx.AsyncClient,
+) -> None:
+    """It is built from the response's nodes, not from the uncapped analysis.
+
+    The two are the same object today because `_analyze_blocking` passes
+    `build_graph`'s output straight through. This pins that: a diagram drawn
+    from `analysis` instead would describe files absent from `nodes`, and the
+    client would see containers it has no way to open.
+    """
+    serve(make_source_tar(REALISTIC))
+
+    body = (await client.post(ANALYZE, json={"repository_url": SUBMITTED_URL})).json()
+
+    # Every container the diagram names is a top-level path component of some
+    # node in this very response.
+    top_level = {node["path"].split("/")[0] for node in body["nodes"]}
+    for line in body["componentDiagram"].splitlines():
+        if (label := re.search(r'^\s+c\d+\["([^"]+)"', line)) is not None:
+            assert label.group(1).split(" ")[0] in top_level
 
 
 @respx.mock

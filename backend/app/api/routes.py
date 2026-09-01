@@ -42,6 +42,7 @@ import logging
 
 from fastapi import APIRouter, Request
 
+from app.analysis.component_diagram import build_component_diagram
 from app.analysis.graph_builder import GraphLimits, build_graph
 from app.analysis.pipeline import analyze_repository
 from app.analysis.resolver import resolve_imports
@@ -134,9 +135,11 @@ def _analyze_blocking(repo: RepoRef, settings: Settings) -> AnalyzeResponse:
         # capped — it is a separate view keyed by path, not part of the graph.
         # See `app/analysis/graph_builder.py`.
         serviceMap=list(analysis.service_map),
-        # TODO: `app/analysis/component_diagram.py` does not exist yet — the
-        # deterministic Mermaid generator is the last open Day 1 item in
-        # docs/TODO.md. The field defaults to absent by contract (ADR-013), so
-        # the response is valid without it and gains it with one line here.
-        componentDiagram=None,
+        # Built from the *capped* `nodes`/`edges` above, never from `analysis`:
+        # the diagram must describe the graph in this response, or it draws
+        # containers for files the client cannot see. `None` for a graph with
+        # no file nodes is ordinary, not a failure (ADR-024).
+        componentDiagram=build_component_diagram(
+            nodes, edges, stats, analysis.service_map, settings=settings
+        ),
     )
