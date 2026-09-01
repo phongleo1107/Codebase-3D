@@ -1,6 +1,6 @@
 # Architecture
 
-> **Build status: the whole analysis half of the backend is implemented — contract layer, URL/egress security boundary, GitHub client, streaming archive reader, secret and path-safety filters, import extractor, the ingestion+parse pipeline that joins them, the MVP module resolver, the description extractor, and the graph builder.** As of 2026-08-31 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, `app/security/secret_filter.py`, `app/security/path_safety.py`, `app/fetch/github.py`, `app/fetch/archive.py`, `app/analysis/deadline.py`, `app/analysis/parser.py`, `app/analysis/pipeline.py`, `app/analysis/resolver.py`, `app/analysis/descriptions.py`, and `app/analysis/graph_builder.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. `app/analysis/pipeline.py` is the first module that calls another — it sends the download, streams it into the reader, applies `is_secret_path`, parses what survives, and quotes each file's header comment — so the fetch → extract → filter → parse → describe half of the flow below is real, and **has been exercised against real GitHub repositories** (`backend/scripts/smoke.py`) rather than fixtures alone — on the happy path only. Resolution is real at MVP scope: relative imports and bare-specifier-as-external, with `tsconfig` `paths`/`baseUrl`/workspaces deferred. **Routing and the frontend still do not exist**, nothing calls the graph builder yet, `safe_relative_path` still has no caller, and `MAX_NODES`/`MAX_EDGES` are enforced nowhere. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
+> **Build status: the whole analysis half of the backend is implemented — contract layer, URL/egress security boundary, GitHub client, streaming archive reader, secret and path-safety filters, import extractor, the ingestion+parse pipeline that joins them, the MVP module resolver, the description extractor, the graph builder, and route detection.** As of 2026-08-31 `app/config.py`, `app/errors.py`, `app/models/`, `app/logging_setup.py`, `app/security/url_validation.py`, `app/security/net_guard.py`, `app/security/secret_filter.py`, `app/security/path_safety.py`, `app/fetch/github.py`, `app/fetch/archive.py`, `app/analysis/deadline.py`, `app/analysis/parser.py`, `app/analysis/pipeline.py`, `app/analysis/resolver.py`, `app/analysis/descriptions.py`, `app/analysis/graph_builder.py`, and `app/analysis/routes.py` exist and are tested; everything else here is the agreed *target* design, recorded so it survives across sessions. `app/analysis/pipeline.py` is the first module that calls another — it sends the download, streams it into the reader, applies `is_secret_path`, parses what survives once, reads both imports and routes off that one tree (ADR-021), and quotes each file's header comment — so the fetch → extract → filter → parse → describe → detect-routes half of the flow below is real, and **has been exercised against real GitHub repositories** (`backend/scripts/smoke.py`) rather than fixtures alone — on the happy path only. Resolution is real at MVP scope: relative imports and bare-specifier-as-external, with `tsconfig` `paths`/`baseUrl`/workspaces deferred. **Routing and the frontend still do not exist**, nothing calls the graph builder yet, `safe_relative_path` still has no caller, and `MAX_NODES`/`MAX_EDGES` are enforced nowhere. Every section carries a status marker; flip it to `Implemented` only when the code exists, and correct the design text if reality diverged.
 >
 > Legend: `Planned` · `In progress` · `Implemented`
 
@@ -9,11 +9,13 @@
 > **MVP scope (2026-08-31, ADR-011/ADR-013):** the 3-day MVP ships the flow below with two simplifications recorded as amendments, not redesigns — the layout worker runs its deterministic sphere-packing phase only (force refinement deferred, ADR-004), and the frontend deploys to Vercel while the backend deploys to a separate persistent host (ADR-011), not `docker compose up` as a single unit.
 >
 > **ADR-013 removed the LLM narration stage that used to sit in this flow.** There is one request path now, not two: descriptions are extracted during the parse from bytes already in memory, so the second round-trip to `raw.githubusercontent.com` that `POST /api/explain` needed is gone with it.
+>
+> **2026-09-01 (ADR-022, supersedes ADR-002/ADR-004):** the visualization stage is a 2D Cytoscape.js graph, not a 3D R3F scene, and layout runs via Cytoscape's own layout algorithms rather than the sphere-packing worker referenced in the first note above. The diagram below reflects this.
 
 ```
 User
  ↓
-Frontend (React + Three.js)          [Vercel]
+Frontend (React + Cytoscape.js)      [Vercel]
  ↓  POST /api/analyze { repository_url }
 FastAPI                              [Railway / Render / Fly]
  ↓
@@ -23,7 +25,7 @@ Graph Model           (GraphNode[] / GraphEdge[] / Stats / ServiceMap)
  ↓
 Component diagram     (deterministic Mermaid, derived from the finished graph — ADR-013)
  ↓
-3D Visualization      (worker layout → instanced R3F scene) + diagram/service-map panel
+2D Visualization      (Cytoscape.js layout + render) + diagram/service-map panel
 ```
 
 Every stage is deterministic, so the whole response is a pure function of the commit SHA — which is what makes a golden-file test over an entire `AnalyzeResponse` possible.
@@ -43,7 +45,7 @@ Python 3.14, FastAPI, Pydantic v2 (pure v2 only — `pydantic.v1` is incompatibl
 | `app/api/` | Routes (`analyze`, `source`, `health`), middleware, rate limiter, concurrency gate | Planned |
 | `app/security/` | URL validation, network guard, secret filter, path safety | **Implemented for MVP scope** — `url_validation.py`, `net_guard.py`, `secret_filter.py`, `path_safety.py`. The first two are called by `fetch/github.py`, `secret_filter.py` by `analysis/pipeline.py`; `path_safety.py` still has **no caller**, since all disk I/O remains unwritten. HMAC tokens are **deferred, not missing**: they belonged to `/api/source` and `/api/explain`, both now out of MVP scope (ADR-013) |
 | `app/fetch/` | GitHub client, streaming archive reader | **Implemented** — `github.py` (preflight + validated redirect) and `archive.py` (streaming extraction + member validation, and the commit SHA from the archive root). `analysis/pipeline.py` calls both |
-| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, description extractor, JSONC reader, module resolver, graph builder, route-detection query (service map), component-diagram generator | **In progress** — `deadline.py`, `parser.py`, `pipeline.py`, `descriptions.py`, `graph_builder.py` Implemented, `resolver.py` In progress; route detection and diagram generator Planned. `pipeline.analyze_repository` returns a content-free `SourceFile` per file (ADR-016) plus the SHA and the skip/truncation counters, and resolves nothing; `resolver.resolve_imports` answers each specifier against that same file list; `graph_builder.build_graph` turns both into sorted, deduplicated nodes/edges/stats (ADR-018); `descriptions.header_description` quotes each file's leading header comment inside the pipeline loop, with no tree and no second parse (ADR-020). The MVP resolver is relative-imports + bare-specifier-as-external only — no `tsconfig.paths`/workspaces (deferred, see TODO.md), with the config seam decided in ADR-017 and stubbed |
+| `app/analysis/` | Pipeline, deadline, file filter, tree-sitter parser, description extractor, JSONC reader, module resolver, graph builder, route-detection query (service map), component-diagram generator | **In progress** — `deadline.py`, `parser.py`, `pipeline.py`, `descriptions.py`, `graph_builder.py`, `routes.py` Implemented, `resolver.py` In progress; diagram generator Planned. `parser.parse_source` produces one guarded tree per file and `parser.extract_imports` / `routes.detect_routes` both read it (ADR-021); `pipeline.analyze_repository` returns a content-free `SourceFile` per file (ADR-016) plus the SHA and the skip/truncation counters, and resolves nothing; `resolver.resolve_imports` answers each specifier against that same file list; `graph_builder.build_graph` turns both into sorted, deduplicated nodes/edges/stats (ADR-018); `descriptions.header_description` quotes each file's leading header comment inside the pipeline loop, with no tree and no second parse (ADR-020). The MVP resolver is relative-imports + bare-specifier-as-external only — no `tsconfig.paths`/workspaces (deferred, see TODO.md), with the config seam decided in ADR-017 and stubbed |
 
 There is **no `app/llm/`**, and there must not be one. ADR-013 removed the LLM layer from the project; adding it back requires superseding that ADR.
 
@@ -74,7 +76,15 @@ The token is never a client-level header — see ADR-009.
 
 ### Source parsing · *Implemented* — `app/analysis/parser.py`
 
-tree-sitter with the TypeScript and TSX grammars. The **TSX grammar is a superset that parses plain JS/JSX**, so `.tsx .js .jsx .mjs .cjs` all use it; `.ts` needs the TypeScript grammar, whose `<T>expr` type assertion TSX reads as a JSX tag. `extract_imports` takes the `Language` as a parameter; choosing it by extension is the caller's job, and that caller is `analysis/pipeline.grammar_for` — matching case-insensitively, so `Main.TS` is TypeScript. `.mts` and `.cts` are **not** in the list above and are therefore not analyzed; that is a gap, tracked in TODO.md, not a decision.
+tree-sitter with the TypeScript and TSX grammars. The **TSX grammar is a superset that parses plain JS/JSX**, so `.tsx .js .jsx .mjs .cjs` all use it; `.ts` needs the TypeScript grammar, whose `<T>expr` type assertion TSX reads as a JSX tag. Choosing the grammar by extension is the caller's job, and that caller is the `_BY_EXTENSION` map in `analysis/pipeline.py` — matching case-insensitively, so `Main.TS` is TypeScript. *(Corrected 2026-08-31: this said `analysis/pipeline.grammar_for`, a function that was never merged — see the PR #2/#3 note in CURRENT_STATE.md.)* `.mts` and `.cts` are **not** in the list above and are therefore not analyzed; that is a gap, tracked in TODO.md, not a decision.
+
+**The module has two entry points, and the split is the seam other analysis modules read the tree through** (ADR-021):
+
+- **`parse_source(source, path, language, deadline, settings) -> Tree | None`** owns every guard between untrusted bytes and tree-sitter — `MAX_PARSE_BYTES`, the binary sniff, the BOM strip, the pathological-tree refusal, and the deadline check on either side of the parse. `None` means the file was refused and a fixed-literal reason was logged.
+- **`extract_imports(tree, path)`** runs the import query over a tree it is handed. It no longer parses, and no longer takes a `Deadline` or a `Settings`.
+- **`string_literal_text(node)`** is the shared primitive for unquoting a string literal strictly — no escapes, no control characters, strict UTF-8. `analysis/routes.py` uses it for route paths, which want the same answer for the same reasons.
+
+There is **one parse per file and as many readers as the analysis needs.** A second reader with its own parse would mean a second copy of all five guards, one of which is the only thing standing between the query engine and an eleven-minute traversal (ADR-010).
 
 A single query captures ESM imports, side-effect imports, `import type`, `export … from`, `export * from`, `import x = require()`, dynamic `import()`, and `require()`. Predicate filtering for `require` happens in Python rather than via `#eq?` — and it has to run over `QueryCursor.matches()`, because `captures()` returns the callees and the strings as two independently ordered lists with the match association discarded.
 
@@ -97,21 +107,38 @@ It runs inside the pipeline loop, from bytes already in memory. That is the whol
 The module splits into a **locator** and a **normalizer**, and the split is load-bearing:
 
 - `header_description(source, settings)` locates the byte-0 case.
-- `normalize_comment(raw, settings)` takes one comment's own text, markers included — the shape a tree-sitter `comment` node yields — and produces the bounded description.
+- `normalize_comment(raw, settings, *, limit=None)` takes one comment's own text, markers included — the shape a tree-sitter `comment` node yields — and produces the bounded description.
 
-`ServiceEndpoint.summary` shares the **second** function only. Its comment sits above a route handler rather than at byte 0, where the scanner's argument does not hold, so route detection will locate that comment from the tree it already has and hand the text here. Locating is per-caller; normalizing is not.
+`ServiceEndpoint.summary` shares the **second** function only, and as of ADR-021 it actually does. Its comment sits above a route handler rather than at byte 0, where the scanner's argument does not hold, so `analysis/routes.py` locates that comment from the tree and hands the text here. Locating is per-caller; normalizing is not. `limit` exists because the two callers land in fields with different bounds — 500 characters for a description, 300 for a summary — and passing the cap in keeps it applied *while* cleaning rather than as a truncation of an already-truncated string.
 
 Normalization happens **at extraction**, before the text reaches a response model, because the output is untrusted repository content being placed in an API response for the first time:
 
 - Comment markers are stripped — `/**`, `*/`, leading `*` on continuation lines, `//`.
 - Whitespace is collapsed to single spaces and non-printable characters are dropped. A description is a label, not a document; a comment containing ANSI escapes or a thousand newlines must not become a thousand-line tooltip. `str.isprintable()` is the test, which also removes the `Cf` bidi-override characters — U+202E and its family reorder how the rest of a line *displays*, which is a spoofing primitive aimed squarely at this sink.
-- Undecodable bytes become U+FFFD rather than discarding the description, deliberately unlike `parser._specifier`'s strict decode: a specifier is compared to a path, a description is only displayed.
+- Undecodable bytes become U+FFFD rather than discarding the description, deliberately unlike `parser.string_literal_text`'s strict decode: a specifier is compared to a path, a description is only displayed.
 - The result is truncated to `MAX_DESCRIPTION_CHARS`, counted while cleaning so the work is bounded by the limit rather than by the size of the comment.
 - Empty-after-normalization yields `None`, not `""` — the model requires `min_length=1`, and "the author wrote `/** */`" is the same fact as "the author wrote nothing".
 
 A secret file can never produce a description, because `is_secret_path` runs before the file is parsed at all (ingestion step 6) — a property of the existing ordering, not a second check. Note what that does and does not cover: it is a rule about *paths*, so it stops `.env` from having a description and says nothing about a secret pasted into a comment in `src/config.ts`. See SECURITY.md.
 
 The description then rides on `SourceFile.description` to the graph builder, which copies it onto the file node. Directory nodes and the repository root have none — a directory has no header comment, and deriving one from a `README` is out of MVP scope.
+
+### Route detection · *Implemented* — `app/analysis/routes.py`, ADR-013, ADR-021
+
+The service map is **deterministic and quoted, never inferred.** `detect_routes(tree, path, deadline, settings)` runs two queries over the tree `parse_source` already produced and yields `ServiceEndpoint` records directly — method, path, file, 0-indexed line, optional summary. A repository that builds its routing table at runtime simply has no service map, because a route is *read*, never registered.
+
+Two detectors, because TS/JS has two conventions and neither subsumes the other:
+
+- **Method calls** — `app.get('/users/:id', handler)`. One query over member-expression calls with the property name filtered against a verb set (`get post put patch delete head options all`) in Python, the same technique and for the same reason as `require` in the import query. Covers Express, Koa's router, Fastify's shorthand, and Hono.
+- **The Next.js App Router file convention** — `app/**/route.ts` exporting `GET`, `POST`, … Here the path is not written in the file at all; it is the directory. So this is a filename test plus a query for exported functions named after an HTTP verb, and the URL is derived from the repository path. `[id]` is left exactly as written rather than rewritten to `:id` — a service map quotes a repository, it does not translate between frameworks — while parenthesised route groups are dropped, because Next.js excludes them from the URL and keeping them yields a path that does not resolve.
+
+**The verb set is not the whole filter, and that is the point.** `map.get('key')` is a member call whose property is an HTTP verb; reporting it would be the route-detection form of a phantom dependency, with a worse blast radius, since a spurious endpoint is one row in a service map of six rather than one line in a graph of thousands. Two further conditions close it: the first argument must be a string literal beginning with `/`, and there must be at least one argument after it — which is also what separates a registration from Express's own one-argument settings getter `app.get('trust proxy')`.
+
+Known and deliberate gaps, each pinned by a test so they stay deliberate: `router.route('/x').get(h)` (path and verb on different calls), Fastify's `fastify.route({method, url})` object form, NestJS decorators, and the Next.js Pages Router (whose default-export handler declares no method). Missing a route leaves the map short; inventing one puts a URL in front of a user that does not exist.
+
+`summary` is the comment *directly above* the enclosing statement — the comment must end on the line immediately before it, and only that statement is examined, never an ancestor, so a route inside a documented function does not inherit the function's JSDoc. A run of `//` lines is **one tree-sitter node per line**, so the run is reassembled backwards; it is never glued to a block comment above it.
+
+Detection is **lazy**, which is what makes the pipeline's `MAX_SERVICE_ENDPOINTS` bound work rather than only output: on the densest legal input an eager implementation builds 61 680 records to keep 200. That cap does **not** set `truncated` — unlike the other two caps it does not abandon the download, and the graph is complete when it fires — so `RepositoryAnalysis.routes_truncated` is a separate flag.
 
 ### Dependency extraction / resolution · *In progress* — `app/analysis/resolver.py`
 
@@ -151,40 +178,37 @@ Every model sets `extra="forbid"`. `parent` is required rather than defaulted �
 
 Output is deterministic — nodes and edges sorted by path components, deduped, self-edges dropped. The same commit produces byte-identical JSON, which is what makes golden-file tests possible. **The models cannot enforce that**: sorting, dedup, and the `stats.dependencies == len(edges)` invariant are `app/analysis/graph_builder.py`'s job, and are now implemented and mutation-tested there. Note the ordering key is the `PurePosixPath.parts` tuple, not the path string — see ADR-018 for why the difference is load-bearing.
 
-**MVP addition — *`description` is populated; the other two fields are not*.** `AnalyzeResponse` carries two top-level fields derived from the same deterministic graph, computed after nodes and edges are final and never feeding back into them: `serviceMap` (deterministically-detected API routes, as `ServiceEndpoint` objects) and `componentDiagram` (Mermaid source). `GraphNode.description` is a third such field, carried per node.
+**MVP addition — *`description` and `serviceMap` are populated; `componentDiagram` is not*.** `AnalyzeResponse` carries two top-level fields derived from the same deterministic graph, computed after nodes and edges are final and never feeding back into them: `serviceMap` (deterministically-detected API routes, as `ServiceEndpoint` objects — produced by `analysis/routes.py` and reachable as `RepositoryAnalysis.service_map`, ADR-021) and `componentDiagram` (Mermaid source, still unwritten). `GraphNode.description` is a third such field, carried per node.
 
 Under ADR-013 all three are **deterministic**, and their provenance is the repository itself rather than a model:
 
 - `GraphNode.description` — the file's own leading header comment, extracted in the pipeline loop by `app/analysis/descriptions.py` (see below). `None` when the file has none, which is the ordinary case. **Implemented.**
-- `ServiceEndpoint.summary` — the comment immediately above the detected route handler. `None` when there is none.
+- `ServiceEndpoint.summary` — the comment immediately above the detected route handler, located from the tree by `app/analysis/routes.py` and normalized by the same function that bounds a description (ADR-021). `None` when there is none. **Implemented.**
 - `componentDiagram` — Mermaid source generated from the finished graph: top-level directories as containers, external packages (ADR-005) as external systems, detected routes as the API surface. **Renamed from `c4`**, because a diagram derived from imports is a component sketch, not a C4 model — C4 encodes intent, which no import graph carries.
 
 All three still **default to absent** — `serviceMap` to `[]`, the other two to `None`. The original reason (an LLM failing independently of the graph) is gone, but the encoding is kept and is still correct for a better reason: **a file that documents itself is the exception, not the rule.** Absent-by-default is the normal case for `description`, not a degraded one, and route detection succeeding while no comment exists above the handler is likewise ordinary. The frontend must render every one of these as optional.
 
-Their size bounds (`MAX_SERVICE_ENDPOINTS`, `MAX_ENDPOINT_SUMMARY_CHARS`, `MAX_COMPONENT_DIAGRAM_CHARS`, `MAX_DESCRIPTION_CHARS`) live in `Settings` like every other limit and are read at validation time. They now bound **repository-authored text** rather than model output, which if anything strengthens the case for them: a comment is attacker-controlled and can be a megabyte long. `MAX_DESCRIPTION_CHARS` has a producer as of ADR-020 and is enforced twice — once at extraction, which is the one that matters, and again at the model boundary, which is the one that catches a future producer that forgets. The other three still bound nothing, because nothing writes them.
+Their size bounds (`MAX_SERVICE_ENDPOINTS`, `MAX_ENDPOINT_SUMMARY_CHARS`, `MAX_COMPONENT_DIAGRAM_CHARS`, `MAX_DESCRIPTION_CHARS`) live in `Settings` like every other limit and are read at validation time. They now bound **repository-authored text** rather than model output, which if anything strengthens the case for them: a comment is attacker-controlled and can be a megabyte long. `MAX_DESCRIPTION_CHARS` has a producer as of ADR-020 and is enforced twice — once at extraction, which is the one that matters, and again at the model boundary, which is the one that catches a future producer that forgets. `MAX_ENDPOINT_SUMMARY_CHARS` and `MAX_SERVICE_ENDPOINTS` gained producers with ADR-021: the summary cap is passed into `normalize_comment` so it applies while cleaning, and the endpoint cap is enforced in the pipeline loop — which means the model's own check on `serviceMap` can never be what fails a request. `MAX_COMPONENT_DIAGRAM_CHARS` still bounds nothing, because nothing writes the diagram.
 
 ## Frontend — `frontend/` · *Planned*
 
-React 19, TypeScript, Vite, Three.js via React Three Fiber, Tailwind v4, Zustand.
+React 19, TypeScript, Vite, Cytoscape.js, Tailwind v4, Zustand. *(2026-09-01, ADR-022: was Three.js/React Three Fiber; see the note at the top of this document.)*
 
 | Directory | Responsibility |
 |---|---|
 | `src/api/` | Client + zod schemas; validates and caps every response |
-| `src/graph/` | Normalization, adjacency, collapse/expand transform, search |
-| `src/layout/` | Structural placement, force refinement, layout Web Worker |
-| `src/scene/` | R3F canvas, instanced nodes, edge lines, camera rig, picking, highlight |
+| `src/graph/` | Normalization, adjacency, collapse/expand transform (Cytoscape compound nodes), search |
+| `src/scene/` | Cytoscape.js canvas: node/edge styling, layout invocation, picking, highlight |
 | `src/ui/` | Landing, loading, tooltip, inspector (description, imports/importedBy), component diagram panel (`mermaid`), service map panel, status bar. Search/tree panel and source preview are deferred post-MVP |
 | `src/store/` | Zustand store |
 
 ### Rendering · *Planned*
 
-A custom R3F scene, not a force-graph library (ADR-002). Roughly four draw calls: one `InstancedMesh` for files, one for directory shells, one `LineSegments` for all edges, and text labels for shallow directories only.
+Cytoscape.js (ADR-022, supersedes ADR-002's custom R3F scene). Directory hierarchy maps directly onto Cytoscape's compound nodes, which is also what backs collapse/expand.
 
 ### Layout · *Planned*
 
-Two phases, both in a Web Worker, then frozen (ADR-004): deterministic nested-sphere placement over the directory tree, then an anchored force pass where imports only bend nodes away from their structural position. The render loop never runs physics.
-
-**MVP scope:** phase one only (sphere-packing). Force refinement is deferred, per ADR-004's 2026-08-31 note — the graph is still legible and fully deterministic without it.
+A single pass using one of Cytoscape's built-in layout algorithms (candidates: `cola`, `elk`, `dagre` — pick during implementation based on how each handles compound nodes at the expected node/edge counts). Runs on the main thread since the graph is already bounded by `MAX_NODES`/`MAX_EDGES`; no custom worker or force-refinement pass (ADR-004, superseded by ADR-022).
 
 ### Component diagram and service map · *Planned*
 

@@ -24,6 +24,8 @@ Follows the PRD's suggested stack. Analysis is stateless and each request is sel
 ### Status
 Accepted
 
+> **Amended by [ADR-022](#adr-022--2d-cytoscapejs-graph-replaces-the-3d-react-three-fiber-scene-supersedes-adr-002-amends-adr-001-adr-004) (2026-09-01).** The frontend term of this decision changes from Three.js to Cytoscape.js (2D). The backend/no-database terms are unchanged.
+
 ---
 
 ## ADR-002 — Custom React Three Fiber scene, not a force-graph library
@@ -41,7 +43,7 @@ Four requirements — directory collapse/expand aggregation, per-state de-emphas
 - 2D libraries (Sigma.js, Cytoscape, D3) — the product is explicitly 3D
 
 ### Status
-Accepted
+Superseded by [ADR-022](#adr-022--2d-cytoscapejs-graph-replaces-the-3d-react-three-fiber-scene-supersedes-adr-002-amends-adr-001-adr-004) (2026-09-01). The product is no longer explicitly 3D, so the "2D libraries — the product is explicitly 3D" rejection below no longer holds; Cytoscape.js is adopted instead. Kept for history.
 
 ---
 
@@ -81,9 +83,9 @@ Layout stays on the client because it is a presentation concern; putting it in t
 - Live simulation in the render loop (needless per-frame cost for a static graph)
 
 ### Status
-Accepted
+Superseded by [ADR-022](#adr-022--2d-cytoscapejs-graph-replaces-the-3d-react-three-fiber-scene-supersedes-adr-002-amends-adr-001-adr-004) (2026-09-01). Cytoscape.js's own layout algorithms replace this custom worker; there is no sphere to pack once the scene is 2D. Kept for history.
 
-> **MVP scope note (2026-08-31):** under the 3-day deadline, only the first phase — deterministic nested-sphere placement over the directory tree — ships initially. The anchored force-refinement pass is deferred, not abandoned; the graph is still legible and fully deterministic without it, and adding force refinement later is additive to this same worker, not a redesign.
+> **MVP scope note (2026-08-31, superseded):** under the 3-day deadline, only the first phase — deterministic nested-sphere placement over the directory tree — ships initially. The anchored force-refinement pass is deferred, not abandoned; the graph is still legible and fully deterministic without it, and adding force refinement later is additive to this same worker, not a redesign.
 
 ---
 
@@ -615,6 +617,91 @@ So the worst adversarial case across an entire analysis is under a second, again
 - **Skip a leading `#!` line**, so a CLI entry point's header is found. One line, and genuinely useful in the npm ecosystem — but a shebang is not one of the three comment forms ADR-013 names, so it is recorded as a known gap in CURRENT_STATE.md with a test pinning the current behaviour, rather than widened quietly here.
 - **Special-case `/// <reference … />`**, which becomes a useless-but-accurate description on some TypeScript files. Declined: it is the file's leading comment, so it is not *wrong*, and the rule "quote the header comment" survives better without an exception list.
 - **Drop a description that is entirely U+FFFD**, which is what a comment of undecodable bytes produces. Declined as a heuristic: the file really does have a comment we cannot read, the cap already bounds it, and "absent but never wrong" does not require "absent whenever ugly".
+
+### Status
+Accepted
+
+---
+
+## ADR-021 — One guarded parse, many readers: the tree is a seam, not a private local
+
+### Decision
+
+`app/analysis/parser.py` splits in two, and `app/analysis/routes.py` is the first module to benefit:
+
+- **`parse_source(source, path, language, deadline, settings) -> Tree | None`** — the *seam*. Every guard that stands between untrusted bytes and tree-sitter lives here and only here: `MAX_PARSE_BYTES`, the binary sniff, the BOM strip, the deadline check before the parse, the pathological-tree refusal, and the deadline check after it. Returns `None` when the file is refused, having logged a fixed-literal reason. Total except for `AnalysisTimeoutError`.
+- **`extract_imports(tree, path) -> Iterator[tuple[str, int]]`** — the import query, over a tree it is handed. Same output as before; it no longer parses and no longer takes a `Deadline` or a `Settings`.
+- **`string_literal_text(node)`** — `_specifier` promoted to a shared primitive, because a route path wants exactly the same strict answer a module specifier does.
+
+`app/analysis/routes.py` runs its own two queries over that same tree and yields `ServiceEndpoint` records directly:
+
+- **Method calls** — `app.get('/users/:id', handler)`. One query over member-expression calls, verb filtered in Python, covering Express, Koa's router, Fastify's shorthand, Hono, and the many libraries that copied the shape.
+- **The Next.js App Router file convention** — `app/**/route.ts` exporting `GET`/`POST`/…, where the path is the *directory* rather than anything written in the file.
+
+`ServiceEndpoint.summary` is the comment directly above the handler, normalized by `descriptions.normalize_comment`, which gains a `limit` parameter so the summary is bounded by `MAX_ENDPOINT_SUMMARY_CHARS` while cleaning rather than truncated afterwards.
+
+The pipeline parses once and feeds both readers. Routes ride on `SourceFile.routes` and flatten through the new `RepositoryAnalysis.service_map`.
+
+### Reason
+
+**A security control with two implementations has two chances to be wrong.** Route detection needs a tree; `extract_imports` built one in a local and discarded it. The alternative to this split was a second module that re-parses, which is what `descriptions.py` was explicitly *allowed* to avoid — and the difference matters. ADR-020 could skip the tree because a header comment is at byte 0, where a scanner and a parser give the same answer. **That argument does not transfer**: a route handler is deep in a file, and locating it lexically is exactly the context-dependent guess ADR-020 refused to make. So route detection must have a tree, and the only question is whether it gets its own. A second parse would mean a second copy of five guards, one of which (`_is_pathological`) is the sole defence against a query that runs for eleven minutes — see ADR-010.
+
+**ADR-020's objection to widening `extract_imports` does not apply here, and that asymmetry is the whole design.** Widening it for *descriptions* would have coupled a description to a successful parse, so a binary file would silently lose its header comment. For *routes* that coupling is not a cost: a file with no tree has no locatable route no matter who looks. So descriptions stay out of the tree path and routes go into it, and both decisions follow from the same question — does this fact exist independently of a successful parse?
+
+**Two conditions beyond the verb set, because a wrong endpoint is worse than a wrong edge.** `map.get('key')` is a member call whose property is an HTTP verb. A detector that stopped at the verb would report it, and this is the route-detection form of the phantom dependency `parser.py` exists to prevent — but with a worse blast radius: a spurious edge is one line in a graph of thousands, while a spurious endpoint is one row in a service map of six, where a reader has no way to tell it from a real one. So the first argument must be a string literal beginning with `/`, and there must be at least one argument after it. The second is what separates a registration from Express's own one-argument settings getter `app.get('trust proxy')`.
+
+**Absent beats invented, again.** `router.route('/x').get(h)` and Fastify's `fastify.route({method, url})` object form are real routes this misses, because the path and the verb live on different nodes. Both are recorded as deliberate gaps with a test pinning the behaviour. This is ADR-013's trade for descriptions applied to routes: a service map that is short is a service map you can trust.
+
+### Consequences
+
+- **`extract_imports` changed shape, and its 75 tests did not.** They all route through one helper in `tests/test_parser.py`, which now composes `parse_source` + `extract_imports` the way the pipeline does. Three `test_pipeline.py` spies moved from `extract_imports` to `parse_source`, and one of them — the secret-filter ordering test — became **strictly stronger**: it now asserts filtered bytes never reach the *parser*, so no reader of the tree can see them. Under the old arrangement a second reader with its own parse would have kept that test green.
+- **The post-parse deadline check moved into `parse_source`**, where it guards every query the caller is about to run instead of only the import one.
+- **`detect_routes`' deadline check sits *outside* its try block, so the catch-all has no `except AnalysisTimeoutError: raise`.** Mutation testing found that re-raise was dead code — nothing inside the guarded region touches the deadline. Making a timeout structurally unswallowable beats defending against swallowing it, which is ADR-009's pattern applied to control flow.
+- **Detection is lazy, and that is a real bound rather than a style.** `_routes` yields; it does not build a list. With an eager list the pipeline's `MAX_SERVICE_ENDPOINTS` stop happens *after* every endpoint in the file exists — measured on the densest legal input (a full `MAX_PARSE_BYTES` of `app.get('/a',h);`) at **61 680 records built to keep 200, 1.11 s for the file, versus 0.31 s stopping at the cap**. The cost is that a mid-file failure now yields a partial service map instead of an empty one, which is the better failure and the same call ADR-019 made about the half-read file. A test counts model constructions, because the difference is invisible in the returned value.
+- **`MAX_SERVICE_ENDPOINTS` does not set `truncated`.** The other two caps abandon the download; this one only stops adding to the service map, and the graph is complete when it fires. `routes_truncated` is a separate flag for the same reason `imports_truncated` is: the consequences differ, so conflating them would overstate what was lost.
+- **A tree-sitter `//` run is one node per line.** `prev_named_sibling` gives only the last line, so `_comment_above` walks the run backwards and reassembles it — the one place where locating from the tree is *harder* than locating from bytes, since `descriptions._line_run` gets it for free. Found by a failing test, not by reading the grammar. A run is never glued to a block comment, because `normalize_comment` dispatches on the first two characters and would leave the `//` markers in the output.
+- **Only the enclosing statement is examined for a summary, never an ancestor.** A climb-until-you-find-a-comment search gives every route inside a documented function that function's JSDoc.
+- **`_endpoint` catches `ValidationError`**, and mutation testing is why. Anything raised there escapes into `detect_routes`' catch-all, which abandons the whole file — so one malformed record would silently delete every *other* route beside it, indistinguishable from a file that declares none. Two separate mutations survived by hiding behind exactly that. One bad record must cost one record.
+- **The route query is a third traversal, and it is cheap on real input.** Measured across 3000 ordinary files: parse 1.45 s, import query 0.94 s, route query **0.48 s** — 17% of the total. `tree.language` returns the identical `Language` object the caller passed, so `lru_cache`d query compilation still hits; a miss per file would cost ~8.8 ms × 3000 ≈ 26 s of a 60 s budget, which was checked before the design was committed to rather than after.
+- **`analysis/` now imports `models/api`**, following `graph_builder.py`'s precedent with `models/graph`. Route detection produces wire records directly rather than an intermediate type, because `ServiceEndpoint` is already exactly the shape — method, path, file, line, optional summary — and a parallel dataclass would exist only to be copied field for field.
+- **25 of 30 controls mutation-tested one at a time are caught; the 5 survivors are equivalent by construction and each is annotated in the code.** They are: the `app`-segment test in `_is_next_route_file` (re-checked by `_next_route_path`); `parts[:-1]` in that same line (the stem test already forces the filename); case-sensitivity of the Next verb set (a non-uppercase name is refused one line later by `HttpMethod`); the `comment` node-type test (`normalize_comment` refuses non-comment input — the first evidence ADR-020's safety net actually holds); and the explicit path-length check (`MemberPath` refuses the same value). Each is kept because relying on a downstream refusal is a worse contract than not producing the value.
+
+### Alternatives considered
+
+- **A second parse in a self-contained `routes.py`**, mirroring `descriptions.py`'s shape and leaving `parser.py` untouched. Rejected on guard duplication, not on cost — the cost was addressable with a byte-substring prefilter, but the five guards were not, and a prefilter would have added a method-set drift hazard on top.
+- **Merging the route patterns into `IMPORT_QUERY`** for a single traversal, dispatching on the pattern index. One traversal instead of two, at the price of entangling two unrelated concerns in one string; the measured 0.48 s across 3000 files did not justify it.
+- **NestJS decorator routers** (`@Controller('/base')` + `@Get('/x')`). Deferred: useful only if the class-level prefix is joined onto each method path, which is the most machinery for the least coverage, and a wrong join produces a confidently wrong URL.
+- **The Next.js Pages Router** (`pages/api/*.ts`). Rejected for MVP: the handler is a default export and declares no method, so every endpoint's `method` would be a guess.
+- **Rewriting Next.js `[id]` to Express `:id`** for a uniform service map. Declined: a service map quotes a repository, it does not translate between frameworks, and `[id]` is what a reader finds when they open the file.
+- **Special-casing `@slot` parallel routes and `_private` folders** alongside route groups. Declined for now — each is another framework rule encoded here, and route groups were included only because omitting them produces a URL that genuinely does not resolve.
+
+### Status
+Accepted
+
+---
+
+## ADR-022 — 2D Cytoscape.js graph replaces the 3D React Three Fiber scene (supersedes ADR-002; amends ADR-001, ADR-004)
+
+### Decision
+The frontend renders the dependency graph as a 2D graph with Cytoscape.js instead of a custom 3D scene built with Three.js/React Three Fiber. Cytoscape's built-in layout algorithms (compound-node-aware, e.g. `cola`/`elk`) replace the hand-written two-phase sphere-packing/force-refinement worker (ADR-004).
+
+### Reason
+This is an owner-driven scope change, not a discovery made while building: the goal shifts from matching the original PRD's "3D visualizer" framing to shipping something small enough for one person to read, own, and learn from end to end, with the least amount of bespoke ("vibecoded") rendering code. ADR-002 rejected 2D libraries specifically because "the product is explicitly 3D" — that premise no longer holds, so the rejection no longer holds either.
+
+Cytoscape.js is a mature, documented graph library whose public API is close to the entire surface area the frontend needs. It already does directory collapse/expand via compound nodes and hierarchy-aware layout — the same requirements ADR-002 used to justify writing a custom R3F scene instead of adopting a 3D wrapper library — so adopting it removes both the custom scene code and the custom two-phase layout worker (ADR-004) in one move, without giving up the collapse/expand or hierarchy-legibility requirements.
+
+### Alternatives considered
+- Plain Three.js without R3F — still true 3D and still most of the bespoke rendering/layout code this decision exists to remove
+- `3d-force-graph` (a thin Three.js wrapper) — less code than raw R3F, but there is no reason to keep 3D once the goal is minimal and learnable rather than maximal fidelity to the original PRD
+- `d3-force` + hand-rolled SVG — the most transparent option (every line drawn is code you wrote), but re-implements collapse/expand and compound grouping that Cytoscape provides directly; more code to learn, not less
+
+### Consequences
+- ADR-002 is superseded in full; ADR-004 is superseded in full. Both are kept in this file for history, per this project's rule against rewriting past decisions.
+- ADR-001's frontend term changes from Three.js to Cytoscape.js (2D); its backend and no-database terms are unchanged.
+- ADR-005 (external packages are not graph nodes) and ADR-006 (hierarchy on a `parent` field, not edges) are unaffected — they are graph-shape decisions independent of the rendering library, and Cytoscape's compound nodes consume a `parent`-shaped hierarchy directly.
+- The wire contract (`GraphNode`, `GraphEdge`, `AnalyzeResponse`) is unaffected — this is a rendering-layer decision only, consistent with "keep frontend visualization separate from graph-analysis logic."
+- `PRD.md` is updated alongside this ADR (title, visualization section, and stack section) rather than left to silently disagree with it, since it was the origin of the "3D" requirement ADR-002 cited.
+- Layout runs on the client, same reasoning as ADR-004: it is a presentation concern, and the backend continues to own no visual decision.
 
 ### Status
 Accepted

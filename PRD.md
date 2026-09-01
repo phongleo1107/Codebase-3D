@@ -1,10 +1,10 @@
-# MVP SPEC — 3D CODEBASE VISUALIZER
+# MVP SPEC — CODEBASE VISUALIZER
 
-## Product
+> **2026-09-01 — visualization is 2D, not 3D (ADR-022 in [docs/DECISIONS.md](docs/DECISIONS.md), supersedes ADR-002 and ADR-004).** The owner's goal shifted from matching this document's original "3D" framing to shipping a small, learnable, minimally-bespoke frontend. The graph renders with Cytoscape.js in 2D. Sections below are updated in place to match; the rest of this document (analysis, data model, security) is unaffected.
 
-Build a polished web application that visualizes a GitHub repository as an interactive 3D dependency graph.
+Build a polished web application that visualizes a GitHub repository as an interactive dependency graph.
 
-Working name: **Codebase 3D**
+Working name: **Codebase 3D** *(name predates the 2D pivot; not renamed)*
 
 Core promise:
 
@@ -24,7 +24,7 @@ User enters:
 https://github.com/owner/repository
 ```
 
-The application analyzes the repository and produces a 3D visualization.
+The application analyzes the repository and produces a 2D visualization.
 
 ### Supported language
 
@@ -44,7 +44,6 @@ Display:
 
 Users can:
 
-* Rotate the 3D scene
 * Zoom/pan
 * Hover nodes
 * Click nodes
@@ -71,7 +70,7 @@ Analyze repository
     ↓
 Build dependency graph
     ↓
-Render 3D visualization
+Render visualization
     ↓
 Explore codebase
 ```
@@ -100,8 +99,7 @@ Suggested stack:
 
 * React
 * TypeScript
-* Three.js
-* React Three Fiber if useful
+* Cytoscape.js (2D graph rendering/layout)
 * Modern CSS/Tailwind
 
 ### Backend
@@ -614,7 +612,7 @@ The MVP is complete when:
 [ ] Repository is treated as untrusted data
 [ ] JS/TS imports are correctly extracted
 [ ] Dependency graph is generated
-[ ] Graph renders in 3D
+[ ] Graph renders (2D)
 [ ] Nodes can be explored
 [ ] Search works
 [ ] Dependency tracing works
@@ -639,7 +637,7 @@ If time runs out, prioritize in this order:
 
 1. Security
 2. Correct dependency graph
-3. 3D visualization
+3. Graph visualization
 4. Navigation/search
 5. Source inspection
 6. Polish
@@ -647,4 +645,4 @@ If time runs out, prioritize in this order:
 
 Do not sacrifice security or correctness to add more features.
 
-Build the smallest product that feels genuinely impressive when someone pastes a repository URL and watches their codebase become a navigable 3D structure.
+Build the smallest product that feels genuinely impressive when someone pastes a repository URL and watches their codebase become a navigable graph.
