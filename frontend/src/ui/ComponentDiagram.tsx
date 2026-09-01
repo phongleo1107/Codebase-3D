@@ -141,8 +141,26 @@
  *                                    Mermaid's own sanitize-url; `a` is not in
  *                                    ALLOWED_ELEMENTS, so we refuse anyway
  *     click c1 call fn()          -> not invoked (securityLevel: 'strict')
- *     click c0 href "https://..." -> emits xlink:href with the xlink namespace
- *                                    undeclared, so step 2 already refuses it
+ *     click c0 href "https://..." -> emits a plain `href` on an <a>. Refused by
+ *                                    step 3, twice: `a` is not in
+ *                                    ALLOWED_ELEMENTS and `href` is on the
+ *                                    denylist below.
+ *
+ * That last row was wrong until 2026-09-01 and is worth the correction rather
+ * than a silent edit. It read "emits xlink:href with the xlink namespace
+ * undeclared, so step 2 already refuses it", and ADR-025 said the same. At
+ * mermaid 11.17.2 there is no `xlink:href` and no `xmlns:xlink` anywhere in the
+ * output — confirmed against the raw serialization under `securityLevel:
+ * 'loose'`, the one branch that skips the whole-SVG DOMPurify pass, so it is
+ * mermaid's own output rather than a DOMPurify rewrite. The document is
+ * well-formed, so step 2 never fires on it. Security-neutral: the directive is
+ * still refused, just one layer later than described. `ComponentDiagram.test.tsx`
+ * pins the real behaviour; ADR-025 carries the full correction.
+ *
+ * Step 2 keeps its value for the case it was actually argued from — html-label
+ * output that is not well-formed XML — and the undeclared-prefix path is still
+ * exercised, by handing this component a crafted document rather than by
+ * relying on mermaid to emit one.
  *
  * Our generator emits no `click`, no `classDef` and no `style` statement. The
  * checks are here because "the generator does not do that today" is a fact
