@@ -4,13 +4,16 @@
  * These are duplicated deliberately, not imported: the frontend does not trust
  * the backend to have enforced them. `docs/ARCHITECTURE.md` "Security
  * Boundaries" calls the API → browser transition its own validation layer, and
- * `docs/CURRENT_STATE.md` records that MAX_NODES / MAX_EDGES are currently
- * enforced *nowhere* on the server (they belong to the unwritten routing
- * layer). So for those two, this file is the only place they bind anything at
- * all today.
+ * it stays one whether or not the server checks too. MAX_NODES / MAX_EDGES are
+ * now enforced there as well — ADR-023 hands `build_graph` a `GraphLimits` so
+ * it builds a smaller graph rather than the router slicing a large one — which
+ * makes this file defence in depth for those two rather than the only depth.
  *
- * If a value here drifts from `Settings`, the symptom is a valid response
- * being rejected — loud, not silent. Keep them in step.
+ * Not trusting the server is not the same as diverging from it. A cap here
+ * that sits *below* its `Settings` counterpart rejects a response the server
+ * was entitled to send, and zod rejects the whole document rather than
+ * trimming it, so the symptom is a blank screen — loud, but loud about the
+ * wrong thing. Keep them in step.
  */
 export const LIMITS = {
   /** Settings.MAX_NODES */
