@@ -63,6 +63,8 @@ frontend/            React app — landing page + real POST /api/analyze call
                      packages, including a second copy of `cytoscape`
   tsconfig.json      strict + exactOptionalPropertyTypes
   vite.config.ts     React + Tailwind v4 plugins; dev-server proxy to :8000
+  vitest.config.ts   jsdom environment; separate from vite.config.ts on purpose
+                     (vitest prefers it and then ignores vite.config.ts)
   index.html
   src/
     api/             schema.ts (zod mirror of the wire contract), limits.ts,
@@ -71,9 +73,12 @@ frontend/            React app — landing page + real POST /api/analyze call
                      regression probe, no longer rendered)
     scene/           GraphCanvas.tsx, style.ts
     ui/              App.tsx, Inspector.tsx, ComponentDiagram.tsx (written and
-                     browser-verified; nothing imports it yet — ADR-025),
-                     ServiceMap.tsx (likewise unwired)
+                     verified; nothing imports it yet — ADR-025),
+                     ComponentDiagram.test.tsx, ServiceMap.tsx (likewise
+                     unwired, and the one panel with no test)
     store/           graphStore.ts
+    no-markup-sinks.test.ts
+                     greps all of src/ for HTML-injection sinks
 .claude/             Local Claude Code permissions, launch config, worktrees
                      (not source; gitignored)
 ```
@@ -88,7 +93,7 @@ frontend/            React app — landing page + real POST /api/analyze call
 | [SECURITY.md](docs/SECURITY.md) | Threat model and control status |
 | [TODO.md](docs/TODO.md) | Prioritized backlog |
 
-`frontend/` is not yet the frontend ARCHITECTURE.md describes — there is no search, no collapse/expand, and **no tests**. *(Corrected 2026-09-01: this used to say "no landing page, no API client" and "no diagram or service-map panel". All four landed the same day, but with an important difference between the pairs. The first pair is **live**: `src/api/client.ts` calls `POST /api/analyze` and `src/ui/App.tsx` gained a landing page, URL input, and loading/error state; `AnalyzeResponseSchema` validated a real response over three real repositories with no field changed. The second pair is **written but unwired**: `src/ui/ComponentDiagram.tsx` renders `componentDiagram` through `mermaid` 11.17.2, adopting the returned SVG out of an inert `DOMParser` document behind an element allowlist rather than injecting it as HTML, and it was driven in a real browser including all four of its refusal paths (ADR-025); `src/ui/ServiceMap.tsx` renders the detected API surface. **Neither is imported by `App.tsx`**, so the app as it runs still shows only the canvas and the inspector. "No tests" is unchanged and is now the sharper gap — the browser evidence behind the diagram panel is manual and not repeatable.)* Under `backend/app/`, `api/` now holds the two MVP endpoints, the middleware, the exception handlers, and — since ADR-008 — the rate limiter and concurrency gate in `rate_limit.py`. **CORS is still missing**, and is the last Day 3 item ARCHITECTURE.md lists there. `analysis/` is **complete for the MVP** at eight modules: the deadline, the parser, the ingestion+parse pipeline, the MVP resolver, the description extractor, the graph builder, route detection, and the component-diagram generator. `security/` is **complete for the MVP** at four modules: the fifth (HMAC tokens) belonged to `/api/source` and `/api/explain`, both of which are now out of MVP scope (ADR-013, and ADR-007's second scope note). There is deliberately no `app/llm/` and there must not be one. Create modules as work begins, and update this section when you do.
+`frontend/` is not yet the frontend ARCHITECTURE.md describes — there is no search and no collapse/expand. It **does** have tests as of 2026-09-01: **vitest 4.1.11 + jsdom 30.0.1, 35 tests in two files** (`src/ui/ComponentDiagram.test.tsx`, `src/no-markup-sinks.test.ts`), run with `npm test`. They automate ADR-025's interactive browser session and are what caught its `click … href` error. Read the caveat with the claim: **no real browser is driven**, so this is jsdom's parser and DOMPurify under it, not Chrome's — it needs two SVG-metric stubs and one patched parse5 row to run at all (ADR-025's Correction). *(Corrected 2026-09-01: this used to say "no landing page, no API client" and "no diagram or service-map panel". All four landed the same day, but with an important difference between the pairs. The first pair is **live**: `src/api/client.ts` calls `POST /api/analyze` and `src/ui/App.tsx` gained a landing page, URL input, and loading/error state; `AnalyzeResponseSchema` validated a real response over three real repositories with no field changed. The second pair is **written but unwired**: `src/ui/ComponentDiagram.tsx` renders `componentDiagram` through `mermaid` 11.17.2, adopting the returned SVG out of an inert `DOMParser` document behind an element allowlist rather than injecting it as HTML, and it was driven in a real browser including all four of its refusal paths (ADR-025); `src/ui/ServiceMap.tsx` renders the detected API surface. **Neither is imported by `App.tsx`**, so the app as it runs still shows only the canvas and the inspector. "No tests" is unchanged and is now the sharper gap — the browser evidence behind the diagram panel is manual and not repeatable.)* *(Corrected again 2026-09-01, later the same day: that last sentence is now false. The tests landed, and they downgraded ADR-025's "driven in a real browser including all four of its refusal paths" too — all four still refuse, but one refuses at a different layer than the ADR claimed. The unwired-panel half of the note stands.)* Under `backend/app/`, `api/` now holds the two MVP endpoints, the middleware, the exception handlers, and — since ADR-008 — the rate limiter and concurrency gate in `rate_limit.py`. **CORS is still missing**, and is the last Day 3 item ARCHITECTURE.md lists there. `analysis/` is **complete for the MVP** at eight modules: the deadline, the parser, the ingestion+parse pipeline, the MVP resolver, the description extractor, the graph builder, route detection, and the component-diagram generator. `security/` is **complete for the MVP** at four modules: the fifth (HMAC tokens) belonged to `/api/source` and `/api/explain`, both of which are now out of MVP scope (ADR-013, and ADR-007's second scope note). There is deliberately no `app/llm/` and there must not be one. Create modules as work begins, and update this section when you do.
 
 ## Development Rules
 
