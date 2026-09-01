@@ -23,7 +23,15 @@ work continued, and a client that retried on that 504 would multiply live
 threads rather than shed them. The bound that exists is the one that works
 cooperatively: `Deadline` (60 s) between archive members and around every parse,
 plus httpx's own connect/read timeouts, plus `MAX_IMPORTS` on the clockless
-phase after it. Shedding load is `MAX_CONCURRENT_ANALYSES`' job and is Day 3's.
+phase after it. Shedding load is `MAX_CONCURRENT_ANALYSES`' job.
+
+**Load shedding now has code behind it** (ADR-008): a per-IP sliding window
+(`RATE_LIMIT_ANALYZE`, `RATE_LIMIT_ANALYZE_HOURLY`) rejects with a 429 and
+`Retry-After` before the URL is even parsed, and a global, non-blocking
+`ConcurrencyGate` (`MAX_CONCURRENT_ANALYSES`) rejects with a 503 immediately
+before the worker thread would be spawned — never after. Both live in
+`app/api/rate_limit.py` and are held on `app.state`, one pair per app
+instance, so they cannot leak hits across a test's fresh `create_app()`.
 
 **`MAX_NODES` / `MAX_EDGES` are enforced by asking for a smaller graph, not by
 slicing a large one** (ADR-023). `build_graph` takes `GraphLimits` and derives
@@ -39,6 +47,7 @@ counts an operator actually needs — how large the graph was, whether a cap fir
 
 import asyncio
 import logging
+import math
 
 from fastapi import APIRouter, Request
 
@@ -47,8 +56,9 @@ from app.analysis.graph_builder import GraphLimits, build_graph
 from app.analysis.pipeline import analyze_repository
 from app.analysis.resolver import resolve_imports
 from app.api.middleware import request_id_of
+from app.api.rate_limit import ConcurrencyGate, SlidingWindowLimiter
 from app.config import Settings, get_settings
-from app.errors import InternalError
+from app.errors import InternalError, RateLimitedError, ServerBusyError
 from app.models.api import AnalyzeRequest, AnalyzeResponse, Repository
 from app.security.url_validation import RepoRef, parse_github_url
 
@@ -74,18 +84,40 @@ async def analyze(payload: AnalyzeRequest, request: Request) -> AnalyzeResponse:
 
     Raises only `AppError` subclasses, all of which carry a static message:
     `InvalidRepositoryUrlError` from the URL grammar, whatever
-    `analyze_repository` raises for the fetch and the parse, and `InternalError`
-    for the one impossible state below.
+    `analyze_repository` raises for the fetch and the parse, `RateLimitedError`
+    / `ServerBusyError` from the two load-shedding checks below, and
+    `InternalError` for the one impossible state at the bottom.
     """
     settings = get_settings()
     request_id = request_id_of(request.scope)
+
+    # Per-IP sliding window, checked before anything else runs (ADR-008). Keyed
+    # on `request.client`, which is the immediate peer — this service has no
+    # reverse proxy in front of it yet, so there is no `X-Forwarded-For` to
+    # trust or spoof.
+    client_ip = request.client.host if request.client else "unknown"
+    limiter: SlidingWindowLimiter = request.app.state.analyze_rate_limiter
+    retry_after = limiter.retry_after(
+        client_ip, (settings.RATE_LIMIT_ANALYZE, settings.RATE_LIMIT_ANALYZE_HOURLY)
+    )
+    if retry_after is not None:
+        raise RateLimitedError(retry_after_s=math.ceil(retry_after))
 
     # Before the thread, and before anything opens a socket: this is the grammar
     # check, not a second one. `analyze_repository` documents that it does not
     # re-validate, so the boundary is here.
     repo = parse_github_url(payload.repository_url)
 
-    response = await asyncio.to_thread(_analyze_blocking, repo, settings)
+    # The global concurrency gate. Checked immediately before the worker
+    # thread would be spawned, not earlier, so a request that fails URL
+    # validation never occupies a slot in the first place.
+    gate: ConcurrencyGate = request.app.state.analyze_concurrency
+    if not gate.try_acquire(settings.MAX_CONCURRENT_ANALYSES):
+        raise ServerBusyError()
+    try:
+        response = await asyncio.to_thread(_analyze_blocking, repo, settings)
+    finally:
+        gate.release()
 
     logger.info(
         "analyze complete: %d nodes, %d edges, %d endpoints, truncated=%s (caps %d/%d)",

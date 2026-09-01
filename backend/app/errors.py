@@ -56,6 +56,10 @@ class AppError(Exception):
     def __init__(self) -> None:
         super().__init__(self.message)
 
+    def headers(self) -> dict[str, str]:
+        """Extra response headers. Empty for every error except `RateLimitedError`."""
+        return {}
+
     def body(self, request_id: str) -> ErrorBody:
         return {
             "error": {
@@ -112,9 +116,24 @@ class AnalysisTimeoutError(AppError):
 
 
 class RateLimitedError(AppError):
+    """Carries `retry_after_s` for the `Retry-After` header only — never the body.
+
+    The one exception to "no per-instance detail": a wait time is not
+    attacker-controlled input and does not appear in `message`, so it cannot
+    reintroduce the echoing problem `__init__`'s no-argument rule guards
+    against.
+    """
+
     code = ErrorCode.RATE_LIMITED
     status_code = 429
     message = "Too many requests. Please try again later."
+
+    def __init__(self, retry_after_s: int) -> None:
+        super().__init__()
+        self.retry_after_s = retry_after_s
+
+    def headers(self) -> dict[str, str]:
+        return {"Retry-After": str(self.retry_after_s)}
 
 
 class ServerBusyError(AppError):

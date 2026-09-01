@@ -1,19 +1,19 @@
 /**
  * Application shell.
  *
- * There is no landing page and no URL input yet, because there is no
- * `POST /api/analyze` to submit to (docs/CURRENT_STATE.md: `backend/app/api/`
- * is an empty package). The store is seeded from `graph/fixture.ts` instead —
- * a hand-written response that goes through the same zod schema a real one
- * will. Replacing the seed with a fetch is the only change this file needs
- * when the endpoint lands.
+ * Landing page (URL input) when nothing has been analyzed yet, the graph
+ * view once a response has landed, and a loading/error state in between —
+ * `analyzeRepository` (src/api/client.ts) is a real `POST /api/analyze` call,
+ * not the `graph/fixture.ts` seed this used to render.
  */
-import { useEffect } from 'react'
+import { useState, type FormEvent } from 'react'
 
-import { FIXTURE_RESPONSE } from '../graph/fixture.ts'
+import { analyzeRepository } from '../api/client.ts'
 import { GraphCanvas } from '../scene/GraphCanvas.tsx'
 import { useGraphStore, useSelectedNode } from '../store/graphStore.ts'
 import { Inspector } from './Inspector.tsx'
+
+type Status = 'idle' | 'loading' | 'error'
 
 export function App() {
   const response = useGraphStore((state) => state.response)
@@ -22,11 +22,57 @@ export function App() {
   const setResponse = useGraphStore((state) => state.setResponse)
   const selectedNode = useSelectedNode()
 
-  useEffect(() => {
-    setResponse(FIXTURE_RESPONSE)
-  }, [setResponse])
+  const [url, setUrl] = useState('')
+  const [status, setStatus] = useState<Status>('idle')
+  const [error, setError] = useState<string | null>(null)
 
-  if (response === null) return null
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const repositoryUrl = url.trim()
+    if (repositoryUrl === '' || status === 'loading') return
+
+    setStatus('loading')
+    setError(null)
+    try {
+      const result = await analyzeRepository(repositoryUrl)
+      setResponse(result)
+      setStatus('idle')
+    } catch (err) {
+      setStatus('error')
+      setError(err instanceof Error ? err.message : 'Analysis failed.')
+    }
+  }
+
+  if (response === null) {
+    return (
+      <div className="flex h-dvh flex-col items-center justify-center gap-4 bg-[#0b0d10] px-4 text-neutral-300">
+        <h1 className="font-mono text-lg text-neutral-100">Codebase 3D</h1>
+        <p className="max-w-md text-center text-xs text-neutral-500">
+          Paste a public GitHub repository URL to graph its dependencies.
+        </p>
+        <form onSubmit={handleSubmit} className="flex w-full max-w-md gap-2">
+          <input
+            type="text"
+            value={url}
+            onChange={(event) => setUrl(event.target.value)}
+            placeholder="https://github.com/owner/repo"
+            disabled={status === 'loading'}
+            className="flex-1 rounded border border-neutral-800 bg-neutral-950 px-3 py-2 font-mono text-xs text-neutral-100 outline-none focus:border-neutral-600 disabled:opacity-50"
+          />
+          <button
+            type="submit"
+            disabled={status === 'loading' || url.trim() === ''}
+            className="shrink-0 rounded bg-neutral-100 px-3 py-2 text-xs font-medium text-neutral-900 disabled:opacity-40"
+          >
+            {status === 'loading' ? 'Analyzing…' : 'Analyze'}
+          </button>
+        </form>
+        {status === 'error' && error !== null && (
+          <p className="max-w-md text-center text-xs text-red-400">{error}</p>
+        )}
+      </div>
+    )
+  }
 
   const { repository, stats } = response
 
@@ -37,9 +83,13 @@ export function App() {
           {repository.owner}/{repository.name}
         </span>
         <span className="font-mono text-[10px] text-neutral-600">{repository.commitSha}</span>
-        <span className="ml-auto text-[10px] uppercase tracking-wider text-amber-600/80">
-          fixture — no backend endpoint yet
-        </span>
+        <button
+          type="button"
+          onClick={() => setResponse(null)}
+          className="ml-auto text-[10px] uppercase tracking-wider text-neutral-500 hover:text-neutral-300"
+        >
+          Analyze another repository
+        </button>
       </header>
 
       <div className="flex min-h-0 flex-1">

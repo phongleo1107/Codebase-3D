@@ -40,6 +40,14 @@ EXPECTED_MAPPING: dict[type[AppError], tuple[ErrorCode, int]] = {
 }
 
 
+def make(error_class: type[AppError]) -> AppError:
+    """Every `AppError` is zero-arg except `RateLimitedError`, whose one
+    argument feeds `Retry-After` rather than the body (`app/errors.py`)."""
+    if error_class is RateLimitedError:
+        return error_class(retry_after_s=60)
+    return error_class()
+
+
 @pytest.mark.parametrize(
     ("error_class", "expected_code", "expected_status"),
     [(cls, code, status) for cls, (code, status) in EXPECTED_MAPPING.items()],
@@ -47,7 +55,7 @@ EXPECTED_MAPPING: dict[type[AppError], tuple[ErrorCode, int]] = {
 def test_error_maps_to_code_and_status(
     error_class: type[AppError], expected_code: ErrorCode, expected_status: int
 ) -> None:
-    error = error_class()
+    error = make(error_class)
     assert error.code is expected_code
     assert error.status_code == expected_status
 
@@ -73,7 +81,7 @@ def test_mapping_is_a_bijection_over_all_codes() -> None:
 
 @pytest.mark.parametrize("error_class", list(EXPECTED_MAPPING))
 def test_body_shape_is_exactly_three_keys(error_class: type[AppError]) -> None:
-    body = error_class().body("req-0123456789ab")
+    body = make(error_class).body("req-0123456789ab")
     assert set(body) == {"error"}
     detail = body["error"]
     assert set(detail) == {"code", "message", "requestId"}
@@ -85,7 +93,7 @@ def test_body_shape_is_exactly_three_keys(error_class: type[AppError]) -> None:
 
 @pytest.mark.parametrize("error_class", list(EXPECTED_MAPPING))
 def test_messages_are_static_user_facing_strings(error_class: type[AppError]) -> None:
-    error = error_class()
+    error = make(error_class)
     assert str(error) == error_class.message
     assert error_class.message
     # No interpolation targets — a message is a constant, never a template.
@@ -103,3 +111,16 @@ def test_constructor_refuses_dynamic_detail() -> None:
 @pytest.mark.parametrize("error_class", list(EXPECTED_MAPPING))
 def test_statuses_are_valid_http_error_codes(error_class: type[AppError]) -> None:
     assert 400 <= error_class.status_code <= 599
+
+
+@pytest.mark.parametrize(
+    "error_class", [cls for cls in EXPECTED_MAPPING if cls is not RateLimitedError]
+)
+def test_only_rate_limited_carries_extra_headers(error_class: type[AppError]) -> None:
+    assert make(error_class).headers() == {}
+
+
+def test_rate_limited_carries_retry_after_and_nothing_in_the_body() -> None:
+    error = RateLimitedError(retry_after_s=42)
+    assert error.headers() == {"Retry-After": "42"}
+    assert "42" not in error.body("req-0123456789ab")["error"]["message"]

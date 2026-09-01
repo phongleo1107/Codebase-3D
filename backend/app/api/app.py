@@ -42,6 +42,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from app.api.middleware import BodySizeLimitMiddleware, RequestIdMiddleware, request_id_of
+from app.api.rate_limit import ConcurrencyGate, SlidingWindowLimiter
 from app.api.routes import router
 from app.config import get_settings
 from app.errors import AppError, InternalError, InvalidRequestError
@@ -78,6 +79,12 @@ def create_app() -> FastAPI:
         ],
     )
 
+    # Per-app, not module-level: a fresh `create_app()` (every test) gets a
+    # fresh clock and an empty concurrency count, rather than inheriting hits
+    # recorded by a previous app instance (ADR-008).
+    app.state.analyze_rate_limiter = SlidingWindowLimiter()
+    app.state.analyze_concurrency = ConcurrencyGate()
+
     app.add_exception_handler(AppError, _app_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_exception_handler(HTTPException, _http_error)
@@ -97,6 +104,7 @@ def _body(request: Request, error: AppError, *, status: int | None = None) -> JS
     return JSONResponse(
         status_code=error.status_code if status is None else status,
         content=error.body(request_id_of(request.scope)),
+        headers=error.headers(),
     )
 
 
