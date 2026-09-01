@@ -495,7 +495,7 @@ Two contradictions that untrusted archives can produce are resolved rather than 
 - `node.imports` / `node.importedBy` are counted off the **finished** edge set, after dedup and self-edge removal, so `sum(imports) == sum(importedBy) == len(edges) == stats.dependencies`. Counting `imports` from the raw import list instead would put two differently-defined numbers side by side in the inspector.
 - `externalImports` / `unresolvedImports` are **statement counts, not distinct-package counts**. Dedup is specified for edges and only for edges, and the resolver deliberately does not extract a package name from a specifier.
 - Directory `fileCount` / `totalBytes` are recursive over all descendants, which is what a containment layout sizes a shell by.
-- The builder is **uncapped**: `MAX_NODES` / `MAX_EDGES` belong to the routing layer. That is a real gap while no router exists, and it is not a free hand-off — a cap cannot simply truncate the returned tuples, because `stats.dependencies == len(edges)` and the per-node counters are computed here and would immediately be false. Whoever applies the cap must re-derive the stats or ask this module for a smaller graph.
+- The builder is **uncapped**: `MAX_NODES` / `MAX_EDGES` belong to the routing layer. That is a real gap while no router exists, and it is not a free hand-off — a cap cannot simply truncate the returned tuples, because `stats.dependencies == len(edges)` and the per-node counters are computed here and would immediately be false. Whoever applies the cap must re-derive the stats or ask this module for a smaller graph. *(**2026-09-01, ADR-023**: the router took the second branch. `build_graph` accepts an optional `GraphLimits` and builds a smaller graph; `None` — every other caller — still builds the whole one, so nothing above is retracted, only chosen between.)*
 - Like `analysis/resolver.py`, the module is pure and has **no logger**: paths are the only repository text it handles, and docs/SECURITY.md keeps those out of records above `DEBUG`. Two tests pin this structurally — one builds a graph with the `os` filesystem primitives torn out, one asserts no log record is emitted at any level.
 - The two preconditions a caller could break — a resolved import whose `source`, or whose `target`, is not in the analysis — raise `ValueError` with a fixed literal message containing no path. A programming error, like `path_safety.safe_relative_path`'s, not an `AppError`.
 
@@ -543,7 +543,7 @@ An import-cap stop is **not** a key in `RepositoryAnalysis.skipped`.
 - Reaching the cap **breaks**, which abandons the generator and therefore the download — identical to `MAX_SOURCE_FILES`, and for the same reason. As there, no count of what was left behind can be reported without paying for the rest of the transfer.
 - **`MAX_IMPORTS` is now the number that governs post-parse cost**, and raising it spends time in a phase with no clock. 100 000 × ~77 µs ≈ 7.9 s, ~13% of `ANALYSIS_TIMEOUT_S` again; the measured 7.7 s confirms it. For scale, `sindresorhus/ky` is 186 imports over 54 files and `pmndrs/zustand` 163 over 50 — ~3.5 per file, so a repository that dense filling all of `MAX_SOURCE_FILES` lands near 10 500. The cap is ~10× that.
 - The worst case is still **not zero cost**: an analysis can now spend ~60 s parsing and then ~8 s resolving. This bounds the total, it does not make the second phase free. `MAX_CONCURRENT_ANALYSES` (3) and the unwritten rate limiter are what bound the aggregate.
-- `MAX_NODES` / `MAX_EDGES` remain enforced nowhere. This ADR closes the *import* half of "post-parse analysis runs outside the deadline"; the graph-size half is still the router's, and the builder measured linear and cheap (300 000 imports in 0.22 s), so it was never the cost problem.
+- `MAX_NODES` / `MAX_EDGES` remain enforced nowhere. This ADR closes the *import* half of "post-parse analysis runs outside the deadline"; the graph-size half is still the router's, and the builder measured linear and cheap (300 000 imports in 0.22 s), so it was never the cost problem. *(**2026-09-01**: closed by ADR-023, which took ADR-018's "or ask this module for a smaller graph" branch for the reason this bullet's neighbours give — the cap belongs where the numbers are still being produced.)*
 - Six mutations of the new control were tested one at a time and **all six are caught**: the check deleted, `>` for `>=`, the counter reset per file, the inner `break` without the outer one, `imports_truncated` set without `truncated`, and the partial file dropped instead of kept.
 
 ### Alternatives considered
@@ -702,6 +702,64 @@ Cytoscape.js is a mature, documented graph library whose public API is close to 
 - The wire contract (`GraphNode`, `GraphEdge`, `AnalyzeResponse`) is unaffected — this is a rendering-layer decision only, consistent with "keep frontend visualization separate from graph-analysis logic."
 - `PRD.md` is updated alongside this ADR (title, visualization section, and stack section) rather than left to silently disagree with it, since it was the origin of the "3D" requirement ADR-002 cited.
 - Layout runs on the client, same reasoning as ADR-004: it is a presentation concern, and the backend continues to own no visual decision.
+
+### Status
+Accepted
+
+---
+
+## ADR-023 — The routing layer: a capped graph from the builder, a worker thread with no `wait_for`, and one exception handler per way out
+
+### Decision
+
+`app/api/` exists: `routes.py` (`POST /api/analyze`, `GET /api/health`), `middleware.py` (request id, request-body cap), `app.py` (the factory and every exception handler), and `app/main.py` as the ASGI entry point. Four decisions inside it are not obvious from the code alone.
+
+**`MAX_NODES` / `MAX_EDGES` are enforced by asking `build_graph` for a smaller graph, not by truncating the graph it returns.** `build_graph` gains an optional `limits: GraphLimits` — a no-default view onto `Settings`, the same shape as `fetch/archive.Limits` — and `None` still builds the whole graph, which is what every direct caller and every determinism test wants. When a cap fires, the node list is cut to a **prefix of component order**, edges naming a dropped node are removed, the edge list is then cut to its own cap, and **only then** is every counter derived. `stats.truncated` is set, sharing the flag the pipeline's two caps already use.
+
+**Nothing is filtered out of `AnalyzeResponse.serviceMap` when the graph is capped**, even when the file declaring a route is no longer a node.
+
+**The analysis runs on a worker thread and there is no `asyncio.wait_for` around it**, contrary to the plan recorded in TODO.md and CURRENT_STATE.md.
+
+**Four exception handlers cover every way a response can leave the application** — `AppError`, `RequestValidationError`, Starlette's `HTTPException`, and a catch-all `Exception` — and `_body` is the single function that constructs an error response.
+
+### Reason
+
+**On capping in the builder.** ADR-018 scoped the cap to the routing layer and named the two ways to apply it: re-derive the stats downstream, or ask the builder for a smaller graph. The first is not a hand-off, it is a re-implementation. A slice of the returned tuples falsifies `stats.dependencies == len(edges)`, every per-node `imports`/`importedBy`, `stats.files`, `stats.directories`, both external/unresolved totals, and every directory's `fileCount`/`totalBytes` — and it can leave an edge naming a node that is gone, which is the one outcome ADR-016's set-membership design exists to make unrepresentable. Rebuilding all of that at the boundary would put two implementations of "how a count is derived" in the project, and the second would be the one nobody mutation-tested. Capping before the counters are computed makes them true by construction, which is the same trade ADR-019 made when it capped imports upstream rather than downstream: *the cap belongs wherever the numbers are still being produced.*
+
+**On dropping the tail of component order.** Determinism alone allows any rule; this one is chosen for a second property that ADR-018 already paid for. A path's parent is a prefix of it in `parts` order, so a parent always sorts before its children and **any prefix of the sorted node list is closed under `parent`**. No surviving node can name a parent that was dropped, with no repair pass and no second traversal. A smarter policy — drop the least-connected leaves, drop the deepest subtrees — would each need their own closure argument and their own justification for which files a user loses; "the front of a deterministic order" is the rule `MAX_SOURCE_FILES` already uses.
+
+**On counts describing the emitted graph.** A capped response reports `externalImports` over the files it contains, not over the repository. The alternative is a total that no set of nodes in the response adds up to, which is exactly the class of lie this ADR exists to prevent; `truncated` is the honest signal that the view is partial. Same reasoning for `stats.files`, which is now counted off emitted file nodes rather than off `analysis.files`.
+
+**On the service map surviving.** It is not part of the graph. It is a separate deterministic view keyed by path, capped independently by `MAX_SERVICE_ENDPOINTS`, and rendered as a list rather than as something clickable-by-node-id. Shortening a repository's reported API surface because a *graph size* cap fired would make a deterministic list quietly wrong — the same "absent beats invented" concern from ADR-021, running the other way. A frontend that resolves `endpoint.file` against the node map must tolerate a miss, which docs/SECURITY.md already requires of it for dangling edges.
+
+**On the worker thread, and on the absence of a timeout around it.** `analyze_repository` blocks for a streaming download plus a tree-sitter parse per file; `resolve_imports` and `build_graph` add a clockless CPU phase measured at up to ~8 s (ADR-019). On the event loop that stalls `/api/health` — and, later, the rate limiter — for the whole 60 s budget, so the entire blocking span goes to `asyncio.to_thread` in one piece. A `wait_for` around it was the plan of record and is declined: docs/SECURITY.md already says it is not the real mechanism, because it cannot kill a thread. It would return a 504 while the work continued, and a client that retried on that 504 would *add* live threads rather than shed them — a timeout that makes an overloaded server worse. The bound that actually holds is cooperative and already built: `Deadline` between archive members and around every parse, httpx's connect/read timeouts under it, and `MAX_IMPORTS` over the phase with no clock. Shedding load is `MAX_CONCURRENT_ANALYSES`' job and it is Day 3's.
+
+**On the handlers, and on why the body cap writes its own response.** `RequestValidationError` must be mapped to a bare `INVALID_REQUEST` because pydantic's `detail` embeds the offending `input` verbatim, which is docs/SECURITY.md's "Pydantic validation echoing user input" row; FastAPI's default handler returns exactly that, so the override is the control. `HTTPException` needs one too: an unknown path and a wrong method are the two most reachable responses in the service and would otherwise be the only two that answer `{"detail": …}` instead of the contracted body.
+
+`BodySizeLimitMiddleware` is the one place that builds a response outside `app.py`, and it has to be. The tidier design — raise `PayloadTooLargeError` from inside `receive()` and let the `AppError` handler shape it — does not survive contact with FastAPI: `fastapi.routing.get_request_handler` wraps the body read in `except Exception: raise HTTPException(400, "There was an error parsing the body")`, so the typed error is swallowed and the client is told its JSON was malformed **with a 400** rather than that its body was too large with a 413. Verified against fastapi 0.141.1. The middleware therefore refuses the request itself, *before the application runs* — which is also the stronger property: an oversized body never reaches application code at all.
+
+### Consequences
+
+- **`MAX_NODES` / `MAX_EDGES` are enforced for the first time**, closing the last open row of docs/SECURITY.md's "Unbounded graph". The bound that already existed was indirect (`MAX_SOURCE_FILES` caps file nodes and nothing else); directory nodes and edges now have one.
+- **A directory whose children all fell past the cut survives as a node with `fileCount` 0**, because it sorts before them. Honest — the directory is really in the repository — and it keeps `root.fileCount == stats.files` true. Pinned by test.
+- **`_edges` runs before the cap**, so its two preconditions still fire when the mispaired record's file would have been dropped. A programming error that reports itself only sometimes is worse than one that never does.
+- **`stats.truncated` now has three producers** — `MAX_SOURCE_FILES`, `MAX_IMPORTS`, and the graph caps. They are deliberately not distinguished on the wire: a consumer's response to all three is the same, and `Stats` is a frozen contract the frontend mirrors.
+- **The request has an id**, generated per request and never read from an inbound header, carried on `scope["state"]`, echoed as `X-Request-ID` and in every error body, and attached to the router's log records via `logging_setup`'s existing `request_id` extra.
+- **`/docs` and `/redoc` are disabled; `/openapi.json` is not.** Both rendered pages load their JavaScript from a public CDN, which would make a third-party script the only remote resource this backend serves — a supply-chain surface bought for a convenience the frontend gets from the schema anyway.
+- **`configure_logging()` lives in `app/main.py`, not in `create_app()`.** It replaces the root logger's handlers, which is right for a server and would tear `caplog` out from under a test that built an app.
+- **`AnalyzeResponse.componentDiagram` is `None` with a TODO**, because `app/analysis/component_diagram.py` does not exist. The field defaults to absent by contract (ADR-013), so the response is valid without it and gains it with one line.
+- **19 controls were mutation-tested one at a time; all 19 are caught.** Two needed work rather than being caught first time. One "survivor" turned out to be a **no-op mutation** — `_nodes` is only ever handed the surviving files, so there is no line to delete; rewritten as passing the full mapping instead, it fails four tests. The other was a **real gap**: deleting the declared-`Content-Length` check left everything green, because the byte counter catches the same request one cap's worth of bytes later. The difference the header check buys is whether an oversized body is *read*, so a test now asserts that not one chunk is pulled.
+- **`tests/` uses `httpx.ASGITransport`, not `starlette.testclient`.** TestClient's httpx integration is deprecated in this Starlette and emits a `DeprecationWarning`, which `filterwarnings = ["error"]` turns into a failure; the transport drives the same app in process, opens no socket, and needs no new dependency.
+- Still not done at this layer and still Day 3's: the rate limiter, the concurrency gate, and CORS.
+
+### Alternatives considered
+
+- **Re-derive the stats in the router after truncating `build_graph`'s output.** ADR-018's other branch. Six counters and two structural invariants re-implemented at the boundary; see above.
+- **Cap inside `resolve_imports` instead.** Same shape as ADR-019's rejected option and wrong for the same reason: the resolver does not know what a node is, and the builder would still compute its counters from whatever it was handed.
+- **Raise a typed error from the body-cap middleware.** Swallowed by FastAPI into a 400; measured, not assumed.
+- **`asyncio.wait_for` around the analysis.** Returns a response while the thread keeps running; converts a retry into a thread leak. The `Deadline` is the bound.
+- **A `nodesTruncated` / `edgesTruncated` flag beside `truncated`.** `Stats` is a frozen wire contract the frontend mirrors verbatim, and the distinction changes nothing a consumer does. The server-side log line carries the caps and the emitted counts, which is where an operator needs it.
+- **Filtering `serviceMap` to surviving nodes.** Makes a deterministic list depend on an unrelated cap.
 
 ### Status
 Accepted
