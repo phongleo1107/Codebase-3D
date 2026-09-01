@@ -28,3 +28,5 @@ coverage/
 
 # OS
 .DS_Store
+# Claude Code local config and worktrees — not source (see CLAUDE.md)
+.claude/
