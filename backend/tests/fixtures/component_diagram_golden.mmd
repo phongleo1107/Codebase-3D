@@ -1,0 +1,20 @@
+%% Component diagram, generated from the dependency graph (ADR-013).
+%% Containers are top-level directories; arrows are import counts.
+flowchart LR
+  subgraph repo["widgets"]
+    c0["(root) · 1 file"]
+    c1["src · 3 files"]
+    c2["tests · 1 file"]
+  end
+  subgraph api["API surface"]
+    r0["GET /users/:id - Fetch one user by id."]
+    r1["POST /users"]
+  end
+  ext["External packages · 6 imports"]
+  r0 --> c1
+  r1 --> c1
+  c0 -->|1| c1
+  c2 -->|1| c1
+  c0 -->|1| ext
+  c1 -->|4| ext
+  c2 -->|1| ext
