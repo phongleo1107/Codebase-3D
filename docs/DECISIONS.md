@@ -708,7 +708,7 @@ Accepted
 
 ---
 
-## ADR-023 — The component diagram draws containers, one unnamed external system, and routes; node ids are synthetic
+## ADR-024 — The component diagram draws containers, one unnamed external system, and routes; node ids are synthetic
 
 ### Decision
 
