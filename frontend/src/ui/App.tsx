@@ -47,7 +47,7 @@ export function App() {
   if (response === null) {
     return (
       <div className="flex h-dvh flex-col items-center justify-center gap-4 bg-[#0d1117] px-4 text-neutral-300">
-        <h1 className="font-mono text-lg text-neutral-100">Codebase 3D</h1>
+        <h1 className="font-mono text-lg text-neutral-100">Codebase 2D</h1>
         <p className="max-w-md text-center text-xs text-neutral-500">
           Paste a public GitHub repository URL to graph its dependencies.
         </p>

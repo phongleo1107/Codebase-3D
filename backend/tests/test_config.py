@@ -51,6 +51,9 @@ EXPECTED_DEFAULTS: dict[str, object] = {
     "RATE_LIMIT_ANALYZE_HOURLY": (60, 3600),
     "RATE_LIMIT_SOURCE": (60, 60),
     "MAX_CONCURRENT_ANALYSES": 3,
+    # Empty: no cross-origin request succeeds until the operator names an origin.
+    # The deployment docs (README.md, ADR-028) say the env form is a JSON array.
+    "CORS_ALLOWED_ORIGINS": (),
 }
 
 
@@ -105,9 +108,11 @@ def test_unrelated_dotenv_key_does_not_crash_startup(tmp_path: Path) -> None:
 def test_env_overrides_are_honored(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MAX_NODES", "123")
     monkeypatch.setenv("RATE_LIMIT_ANALYZE", "[10, 120]")
+    monkeypatch.setenv("CORS_ALLOWED_ORIGINS", '["https://a.example", "https://b.example"]')
     settings = make_settings()
     assert settings.MAX_NODES == 123
     assert settings.RATE_LIMIT_ANALYZE == (10, 120)
+    assert settings.CORS_ALLOWED_ORIGINS == ("https://a.example", "https://b.example")
 
 
 def test_github_token_is_secret_and_never_exposed() -> None:

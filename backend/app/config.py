@@ -116,6 +116,16 @@ class Settings(BaseSettings):
     RATE_LIMIT_SOURCE: tuple[int, int] = (60, 60)
     MAX_CONCURRENT_ANALYSES: int = 3
 
+    # --- Cross-origin access (deployment, ADR-028) ---
+    # The exact origin(s) allowed to call this API from a browser. Empty (the
+    # default) allows no cross-origin request at all — locally the Vite dev
+    # server proxies `/api`, so nothing needs this set. Set via the environment
+    # as a JSON array, e.g. `CORS_ALLOWED_ORIGINS='["https://app.example.com"]'`.
+    # Never a wildcard: an allowed origin is matched by exact string equality,
+    # so a page at any other origin gets no CORS headers and its browser blocks
+    # both sides of a cross-origin call (ADR-028).
+    CORS_ALLOWED_ORIGINS: tuple[str, ...] = ()
+
     # --- Secrets ---
     # Optional; raises GitHub API rate limits only. Never sent to codeload.
     GITHUB_TOKEN: SecretStr | None = None

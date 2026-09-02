@@ -75,7 +75,7 @@ GITHUB_API_ROOT = "https://api.github.com"
 BASE_HEADERS: dict[str, str] = {
     "Accept": "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
-    "User-Agent": "codebase-3d",
+    "User-Agent": "codebase-2d",
 }
 
 # Any 3xx carrying a Location is treated the same way: validated, never

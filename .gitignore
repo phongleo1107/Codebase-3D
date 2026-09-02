@@ -13,6 +13,9 @@ node_modules/
 dist/
 build/
 
+# Vercel CLI local project link (created by `vercel link` / `vercel init`)
+.vercel/
+
 # Environment — never commit real secrets; the example template is tracked
 .env
 .env.*

@@ -1016,3 +1016,61 @@ This also retires a claim made above: the `~90 -> 0` express figure in the pass'
 
 ### Status
 Accepted (with the two 2026-09-02 corrections above)
+
+---
+
+## ADR-028 — CORS as an explicit origin allowlist, plus in-tree deploy scaffolding (frontend on Vercel, backend on Render)
+
+### Decision
+
+Two decisions taken together on 2026-09-02, because each *needs* the other to deploy.
+
+**CORS is an explicit origin allowlist, never a wildcard.** `app/config.py` gained
+`CORS_ALLOWED_ORIGINS` (default empty — nothing is allowed cross-origin), enforced by
+`CORSMiddleware` as the **outermost** middleware in `app/api/app.py` so a preflight is
+answered before the application or the request-id/body-cap middleware runs. Methods are
+limited to `GET`/`POST`/`OPTIONS`, headers to `Content-Type`, credentials are off, and an
+allowed origin is matched by exact string equality — never `*` and never a reflected
+`Origin`.
+
+**The deploy scaffolding lives in the tree.** `frontend/vercel.json` pins the Vite
+framework, build command (`npm run build`) and output directory (`dist`); `render.yaml`
+is a Render blueprint for the backend (`rootDir: backend`, a `uv`-based build, the
+`uvicorn` start command on `$PORT`, `/api/health`); `.env.example` documents
+`VITE_API_URL`, `CORS_ALLOWED_ORIGINS`, and the optional `GITHUB_TOKEN`. This keeps
+ADR-011's split deployment while making the split reproducible instead of a
+step-by-step dashboard walkthrough.
+
+### Reason
+
+The frontend lives on a different origin than the backend, and a cross-origin
+`POST /api/analyze` with a JSON body preflights; without CORS headers the browser blocks
+it. The allowlist is deliberately narrow because CORS is **not** auth — a disallowed
+origin still gets its request processed, the browser just refuses to read the response,
+so the widening has to be as small as the deploy allows and the rate limiter/concurrency
+gate (ADR-008) stay load-bearing for non-browser clients. Empty-by-default keeps local
+development correct with zero configuration: the Vite dev-server proxy keeps the browser
+request same-origin, so nothing needs to be set.
+
+Render was chosen over Railway/Fly as the *documented* default only — all three support
+the same Python 3.14 + `uv sync` + `uvicorn` shape, and the environment variables are
+identical, so switching hosts is a one-line change in `render.yaml`, not a redesign.
+Vercel's Python runtime remains explicitly out (ADR-011): execution caps and cold starts
+are a poor fit for a 60s streaming-download + tree-sitter analysis, and the native
+grammar wheels are unverified there.
+
+### Alternatives considered
+
+- `allow_origins=["*"]` — the deploy would "just work", and would also let any page on
+  the internet drive a visitor's browser into `/api/analyze` and read its result.
+- Reflecting the request `Origin` — turns CORS into "any origin that asks politely",
+  i.e. the same thing as `*` with extra steps.
+- `allow_origin_regex` — a prefix/regex match needs to be deliberately tighter than a
+  `.vercel.app` suffix, and `endswith`-class mistakes were already rejected once in this
+  project (`net_guard.validate_download_url`); exact equality has no such failure mode.
+- Deploying the backend on Vercel's serverless Python runtime — rejected in ADR-011 for
+  execution-time and native-wheel reasons; not revisited here.
+
+### Status
+
+Accepted

@@ -1,0 +1,26 @@
+# Render blueprint for the Codebase 2D backend (ADR-028).
+#
+# The backend is a persistent process, not a serverless function: it streams a
+# multi-megabyte tarball download and parses with tree-sitter under a 60s
+# analysis deadline (ADR-011), so it does not run on Vercel's Python runtime.
+# The frontend lives on Vercel and is pointed here with VITE_API_URL.
+#
+# Railway and Fly work with equivalent settings (Python 3.14 + `uv sync` + the
+# same start command); Render's `render.yaml` is the documented starting point.
+#
+# Before the first successful build: create the service from this blueprint,
+# add CORS_ALLOWED_ORIGINS as a JSON array naming the Vercel origin (and
+# optionally GITHUB_TOKEN), then open /api/health to confirm the service is up.
+services:
+  - type: web
+    name: codebase-2d-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    # Render's Python image does not ship `uv`, and the project pins Python
+    # 3.14 (`pyproject.toml`), so the build installs uv and a 3.14 interpreter
+    # before syncing the pinned dependency set.
+    buildCommand: python -m pip install uv && uv python install 3.14 && uv sync --python 3.14
+    # `$PORT` is Render-provided; the app listens on 0.0.0.0, not localhost.
+    startCommand: uv run --python 3.14 uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-**Codebase 3D** — paste a public GitHub URL, get an interactive dependency graph of a TypeScript/JavaScript codebase. *(Name predates the 2026-09-01 2D pivot below; not renamed.)*
+**Codebase 2D** — paste a public GitHub URL, get an interactive dependency graph of a TypeScript/JavaScript codebase. *(Renamed from "Codebase 3D" on 2026-09-02; the original name predated the 2026-09-01 2D pivot below.)*
 
 **Current MVP goal:** the smallest product that feels genuinely impressive when someone pastes a repo URL and watches their codebase become a navigable graph. V1 supports **TS/JS only**.
 

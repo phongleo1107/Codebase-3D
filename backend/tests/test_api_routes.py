@@ -62,6 +62,10 @@ SUBMITTED_URL = f"https://github.com/{OWNER}/{NAME}"
 
 PUBLIC_IP = "140.82.121.4"
 
+# One origin in the allowlist for the CORS tests (ADR-028). The default app
+# (an empty `CORS_ALLOWED_ORIGINS`) counts every origin as disallowed.
+ALLOWED_ORIGIN = "https://codebase-2d.vercel.app"
+
 ANALYZE = "/api/analyze"
 HEALTH = "/api/health"
 
@@ -126,6 +130,29 @@ def use_settings(monkeypatch: pytest.MonkeyPatch, **overrides: Any) -> None:
     monkeypatch.setattr(
         "app.api.routes.get_settings", lambda: Settings(**overrides), raising=True
     )
+
+
+@pytest.fixture
+def cors_app(monkeypatch: pytest.MonkeyPatch) -> FastAPI:
+    """An app whose CORS allowlist names exactly one origin (ADR-028).
+
+    Built after patching `app.api.app.get_settings` — the factory reads it at
+    construction time, so the patch must be in place before `create_app()` runs.
+    """
+    monkeypatch.setattr(
+        "app.api.app.get_settings",
+        lambda: Settings(CORS_ALLOWED_ORIGINS=(ALLOWED_ORIGIN,)),
+        raising=True,
+    )
+    return create_app()
+
+
+@pytest.fixture
+async def cors_client(cors_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
+    """Like `client`, but against an app that allows `ALLOWED_ORIGIN`."""
+    transport = httpx.ASGITransport(app=cors_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        yield c
 
 
 def error_of(response: httpx.Response) -> dict[str, str]:
@@ -786,3 +813,86 @@ async def test_the_service_map_survives_a_node_cap(
     assert [endpoint["path"] for endpoint in body["serviceMap"]] == ["/healthz"]
     assert body["serviceMap"][0]["file"] not in node_map(body)
     assert_internally_consistent(body)
+
+
+# --------------------------------------------------------------------------
+# Cross-origin access (ADR-028)
+# --------------------------------------------------------------------------
+#
+# CORS is browser-enforced, not auth: a disallowed origin still gets the
+# response, but without an `Access-Control-Allow-Origin` header the browser
+# refuses to read it. The allowlist's job is to withhold that header — and to
+# answer the preflight that a JSON cross-origin POST triggers.
+
+
+async def test_preflight_from_an_allowed_origin_is_answered_with_cors_headers(
+    cors_client: httpx.AsyncClient,
+) -> None:
+    """The preflight is answered by the middleware, before the app runs."""
+    response = await cors_client.options(
+        ANALYZE,
+        headers={
+            "Origin": ALLOWED_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == ALLOWED_ORIGIN
+    assert "POST" in response.headers["access-control-allow-methods"]
+    # Starlette unions `Content-Type` with its safelisted headers and echoes
+    # them with canonical casing, so compare case-insensitively.
+    assert "content-type" in response.headers["access-control-allow-headers"].lower()
+
+
+async def test_preflight_from_a_disallowed_origin_gets_no_cors_headers(
+    client: httpx.AsyncClient,
+) -> None:
+    """With the default empty allowlist, every origin is disallowed."""
+    response = await client.options(
+        ANALYZE,
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+
+    assert "access-control-allow-origin" not in response.headers
+    # Not the API error contract on purpose: this is the middleware answering a
+    # preflight, not an `/api/` response, and the browser only looks at headers.
+    assert response.status_code == 400
+
+
+@respx.mock
+async def test_an_allowed_origin_is_echoed_on_a_real_response(
+    cors_client: httpx.AsyncClient,
+) -> None:
+    """A real analyze keeps working cross-origin once the origin is allowlisted."""
+    serve(chain_repository())
+
+    response = await cors_client.post(
+        ANALYZE,
+        json={"repository_url": SUBMITTED_URL},
+        headers={"Origin": ALLOWED_ORIGIN},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == ALLOWED_ORIGIN
+
+
+@respx.mock
+async def test_a_disallowed_origin_is_refused_the_header_but_not_the_request(
+    client: httpx.AsyncClient,
+) -> None:
+    """No `Access-Control-Allow-Origin`, so the browser cannot read the body."""
+    serve(chain_repository())
+
+    response = await client.post(
+        ANALYZE,
+        json={"repository_url": SUBMITTED_URL},
+        headers={"Origin": "https://evil.example"},
+    )
+
+    assert response.status_code == 200
+    assert "access-control-allow-origin" not in response.headers

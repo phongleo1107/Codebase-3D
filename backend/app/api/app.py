@@ -30,6 +30,12 @@ only a request id. Note the handler must not serialize exception attributes —
 `app/security/url_validation.py` re-raises with ``from None``, which suppresses
 the *display* of the original but leaves it reachable on ``__context__``, and
 that original quotes the user's URL.
+**CORS lives here, as the outermost middleware.** `CORSMiddleware` wraps
+everything else so a preflight is answered without the application (or even the
+request-id/body-cap middleware) running. An allowed origin is an exact string
+from `Settings.CORS_ALLOWED_ORIGINS`, never a wildcard or a reflected `Origin`
+(ADR-028); with the default empty tuple nothing is allowed cross-origin, which
+is exactly right locally, where the Vite dev server proxies `/api`.
 """
 
 import logging
@@ -38,6 +44,7 @@ from fastapi import FastAPI
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -59,7 +66,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
 
     app = FastAPI(
-        title="Codebase 3D",
+        title="Codebase 2D",
         # Nothing about the running process reaches a client: no version, and
         # the description says what the API does, not what it is built on.
         description="Dependency-graph analysis for a public GitHub TS/JS repository.",
@@ -71,6 +78,17 @@ def create_app() -> FastAPI:
         docs_url=None,
         redoc_url=None,
         middleware=[
+            # Outermost, so a preflight is answered before the application —
+            # or even the request-id/body-cap middleware — runs (ADR-028).
+            Middleware(
+                CORSMiddleware,
+                allow_origins=list(settings.CORS_ALLOWED_ORIGINS),
+                # Only what the frontend's fetch uses. OPTIONS is the preflight
+                # itself; GET serves /api/health.
+                allow_methods=["GET", "POST", "OPTIONS"],
+                allow_headers=["Content-Type"],
+                allow_credentials=False,
+            ),
             # Outermost, so the id exists before anything can fail.
             Middleware(RequestIdMiddleware),
             Middleware(

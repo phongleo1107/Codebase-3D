@@ -114,7 +114,7 @@ wheels = [
 ]
 
 [[package]]
-name = "codebase-3d-backend"
+name = "codebase-2d-backend"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

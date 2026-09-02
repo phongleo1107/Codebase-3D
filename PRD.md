@@ -4,7 +4,7 @@
 
 Build a polished web application that visualizes a GitHub repository as an interactive dependency graph.
 
-Working name: **Codebase 3D** *(name predates the 2D pivot; not renamed)*
+Working name: **Codebase 2D** *(renamed from "Codebase 3D" on 2026-09-02; the original name predated the 2D pivot.)*
 
 Core promise:
 
